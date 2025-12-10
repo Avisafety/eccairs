@@ -1,0 +1,12 @@
+{
+  "name": "avisafe-eccairs-gateway",
+  "version": "1.0.0",
+  "description": "ECCAIRS API-gateway for Avisafe",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.0"
+  }
+}
