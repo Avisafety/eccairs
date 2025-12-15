@@ -1,6 +1,42 @@
 const express = require("express");
 const app = express();
 const Joi = require("joi");
+const { createClient } = require('@supabase/supabase-js');
+
+// Konfigurer Supabase-klienten med dine API-nøkler
+const supabase = createClient('https://your-project-url.supabase.co', 'public-anon-key');
+
+app.post("/eccairs/report", async (req, res) => {
+  try {
+    const report = req.body;
+    
+    // Slå opp tenant ved å hente company_id basert på en unik identifikator
+    const { data: tenant, error } = await supabase
+      .from('companies')
+      .select('*')
+      .eq('company_id', report.reportingEntityId)
+      .single();
+
+    if (error) {
+      return res.status(400).json({ error: "Tenant ikke funnet" });
+    }
+
+    console.log("Tenant funnet:", tenant);
+
+    // TODO: Mapp data til ECCAIRS-format
+    // TODO: Send videre til Safetydata API med fetch()
+
+    res.json({
+      status: "ok",
+      message: "Rapport mottatt og tenant verifisert",
+      tenant: tenant,
+      received: report
+    });
+  } catch (error) {
+    console.error("Feil i /eccairs/report:", error);
+    res.status(500).json({ error: "Noe gikk galt på serveren" });
+  }
+});
 
 // Eksempel på validering av rapportdata
 const reportSchema = Joi.object({
