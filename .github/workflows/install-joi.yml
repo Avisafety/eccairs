@@ -1,0 +1,25 @@
+name: Install Joi
+
+on: 
+  push:
+    branches:
+      - main
+
+jobs:
+  install_joi:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v2
+        with:
+          node-version: '16'  # Velg Node.js-versjonen du bruker
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install Joi
+        run: npm install joi
