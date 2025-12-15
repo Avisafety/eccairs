@@ -4,8 +4,17 @@ const Joi = require("joi");
 const { createClient } = require('@supabase/supabase-js');
 const fetch = require('node-fetch');
 
-// Konfigurer Supabase-klienten med dine API-nøkler
-const supabase = createClient('https://your-project-url.supabase.co', 'public-anon-key');
+// Hent Supabase URL og Anon Key fra Fly.io secrets
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://pmucsvrypogtttrajqxq.supabase.co';  // Sett URL hvis du har den som secret
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;  // Anon key fra Fly.io secrets
+
+if (!SUPABASE_ANON_KEY) {
+  console.error("Supabase anon key er ikke satt som secret!");
+  process.exit(1);  // Stopp applikasjonen hvis API-nøkkelen ikke er tilgjengelig
+}
+
+// Konfigurer Supabase-klienten med API-nøkkelen fra miljøvariabelen
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 // Eksempel på validering av rapportdata med Joi
 const reportSchema = Joi.object({
@@ -37,10 +46,9 @@ app.post("/eccairs/report", async (req, res) => {
       return res.status(400).json({ error: "Tenant ikke funnet" });
     }
 
-    // Logg tenant (kan være nyttig for debugging)
     console.log("Tenant funnet:", tenant);
 
-    // Mapp data til ECCAIRS-format (du kan legge til mer spesifikk mapping her)
+    // Mapp data til ECCAIRS-format (forbered dataene før videre sending)
     const eccairsData = {
       type: report.type,
       reportingEntityId: report.reportingEntityId,
@@ -48,11 +56,11 @@ app.post("/eccairs/report", async (req, res) => {
       status: report.status,
     };
 
-    // Send data til Safetydata API (f.eks., ved hjelp av fetch())
+    // Send data videre til Safetydata API med fetch()
     const response = await fetch('https://safetydata.api.endpoint/submit', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer YOUR_ACCESS_TOKEN`, // Sett inn din API-token
+        'Authorization': `Bearer YOUR_ACCESS_TOKEN`, // Bruk riktig API-token
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(eccairsData),
