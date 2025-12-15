@@ -1,0 +1,25 @@
+name: Install Supabase JS
+
+on:
+  push:
+    branches:
+      - main  # Bytt ut med den grenen du ønsker å bruke
+
+jobs:
+  install_dependencies:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v2
+        with:
+          node-version: '16'  # Velg Node.js-versjonen som passer til prosjektet ditt
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install Supabase JS
+        run: npm install @supabase/supabase-js
