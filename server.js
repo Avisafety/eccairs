@@ -2,7 +2,7 @@ const express = require("express");
 const app = express();
 const Joi = require("joi");
 const { createClient } = require('@supabase/supabase-js');
-const fetch = require('node-fetch');
+
 
 // Hent Supabase URL og Anon Key fra Fly.io secrets
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://pmucsvrypogtttrajqxq.supabase.co';  // Sett URL hvis du har den som secret
