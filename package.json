@@ -9,7 +9,6 @@
   "dependencies": {
     "@supabase/supabase-js": "^2.0.0",
     "express": "^4.19.0",
-    "joi": "^17.6.0",
-    "undici": "^7.18.0"
+    "joi": "^17.6.0"
   }
 }
