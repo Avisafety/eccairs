@@ -24,6 +24,20 @@ const reportSchema = Joi.object({
   status: Joi.string().valid("SENT", "OPEN", "DRAFT").default("DRAFT")
 });
 
+const { getE2AccessToken } = require("./e2Client");
+
+// Token test – returnerer bare OK
+app.post("/api/e2/token/test", async (req, res) => {
+  try {
+    // trigger token fetch
+    const token = await getE2AccessToken();
+    res.json({ ok: true, token_present: !!token });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err.message || err) });
+  }
+});
+
+
 // Endepunkt for å motta og validere rapporter
 app.post("/eccairs/report", async (req, res) => {
   try {
