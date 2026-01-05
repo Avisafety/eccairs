@@ -1,35 +1,42 @@
 const express = require("express");
 const app = express();
-const Joi = require("joi");
-const { createClient } = require('@supabase/supabase-js');
 
+app.use(express.json({ limit: "2mb" }));
 
-// Hent Supabase URL og Anon Key fra Fly.io secrets
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://pmucsvrypogtttrajqxq.supabase.co';  // Sett URL hvis du har den som secret
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;  // Anon key fra Fly.io secrets
-
-if (!SUPABASE_ANON_KEY) {
-  console.error("Supabase anon key er ikke satt som secret!");
-  process.exit(1);  // Stopp applikasjonen hvis API-nøkkelen ikke er tilgjengelig
+// Polyfill Web APIs if missing (fixes "Headers is not defined" on Fly)
+if (typeof Headers === "undefined" || typeof fetch === "undefined") {
+  const undici = require("undici");
+  globalThis.fetch = undici.fetch;
+  globalThis.Headers = undici.Headers;
+  globalThis.Request = undici.Request;
+  globalThis.Response = undici.Response;
 }
 
-// Konfigurer Supabase-klienten med API-nøkkelen fra miljøvariabelen
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const Joi = require("joi");
+const { createClient } = require("@supabase/supabase-js");
 
-// Eksempel på validering av rapportdata med Joi
+const SUPABASE_URL =
+  process.env.SUPABASE_URL || "https://pmucsvrypogtttrajqxq.supabase.co";
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+
+let supabase = null;
+if (!SUPABASE_ANON_KEY) {
+  console.warn("Supabase anon key er ikke satt som secret! Starter uten Supabase.");
+} else {
+  supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+}
+
 const reportSchema = Joi.object({
   type: Joi.string().valid("REPORT", "VALIDATED", "OCCURRENCE").required(),
-  taxonomyCodes: Joi.object().required(), // Legg til detaljert validering for taxonomyCodes
+  taxonomyCodes: Joi.object().required(),
   reportingEntityId: Joi.number().integer().required(),
-  status: Joi.string().valid("SENT", "OPEN", "DRAFT").default("DRAFT")
+  status: Joi.string().valid("SENT", "OPEN", "DRAFT").default("DRAFT"),
 });
 
 const { getE2AccessToken } = require("./e2Client");
 
-// Token test – returnerer bare OK
 app.post("/api/e2/token/test", async (req, res) => {
   try {
-    // trigger token fetch
     const token = await getE2AccessToken();
     res.json({ ok: true, token_present: !!token });
   } catch (err) {
@@ -37,32 +44,29 @@ app.post("/api/e2/token/test", async (req, res) => {
   }
 });
 
-
-// Endepunkt for å motta og validere rapporter
 app.post("/eccairs/report", async (req, res) => {
   try {
     const report = req.body;
 
-    // Valider data mot ECCAIRS-formatet
     const { error } = reportSchema.validate(report);
     if (error) {
       return res.status(400).json({ error: error.details[0].message });
     }
 
-    // Slå opp tenant ved å hente company_id basert på en unik identifikator
+    if (!supabase) {
+      return res.status(503).json({ error: "Supabase er ikke konfigurert på serveren" });
+    }
+
     const { data: tenant, error: tenantError } = await supabase
-      .from('companies')
-      .select('*')
-      .eq('company_id', report.reportingEntityId)
+      .from("companies")
+      .select("*")
+      .eq("company_id", report.reportingEntityId)
       .single();
 
-    if (tenantError) {
+    if (tenantError || !tenant) {
       return res.status(400).json({ error: "Tenant ikke funnet" });
     }
 
-    console.log("Tenant funnet:", tenant);
-
-    // Mapp data til ECCAIRS-format (forbered dataene før videre sending)
     const eccairsData = {
       type: report.type,
       reportingEntityId: report.reportingEntityId,
@@ -70,44 +74,39 @@ app.post("/eccairs/report", async (req, res) => {
       status: report.status,
     };
 
-    // Send data videre til Safetydata API med fetch()
-    const response = await fetch('https://safetydata.api.endpoint/submit', {
-      method: 'POST',
+    const response = await fetch("https://safetydata.api.endpoint/submit", {
+      method: "POST",
       headers: {
-        'Authorization': `Bearer YOUR_ACCESS_TOKEN`, // Bruk riktig API-token
-        'Content-Type': 'application/json',
+        Authorization: `Bearer YOUR_ACCESS_TOKEN`,
+        "Content-Type": "application/json",
       },
       body: JSON.stringify(eccairsData),
     });
 
-    const responseData = await response.json();
+    const responseData = await response.json().catch(() => ({}));
 
     if (response.ok) {
-      res.json({
+      return res.json({
         status: "ok",
         message: "Rapport sendt til Safetydata",
         data: responseData,
       });
-    } else {
-      res.status(response.status).json({
-        status: "error",
-        message: "Feil ved sending til Safetydata",
-        details: responseData,
-      });
     }
 
+    return res.status(response.status).json({
+      status: "error",
+      message: "Feil ved sending til Safetydata",
+      details: responseData,
+    });
   } catch (error) {
     console.error("Feil i /eccairs/report:", error);
     res.status(500).json({ error: "Noe gikk galt på serveren" });
   }
 });
 
-// Healthcheck / test
-app.get("/", (req, res) => {
-  res.send("Avisafe ECCAIRS gateway kjører ✅");
-});
+app.get("/", (req, res) => res.send("Avisafe ECCAIRS gateway kjører ✅"));
 
 const port = process.env.PORT || 8080;
-app.listen(port, () => {
+app.listen(port, "0.0.0.0", () => {
   console.log(`Server kjører på port ${port}`);
 });
