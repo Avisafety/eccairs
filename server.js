@@ -3,14 +3,7 @@ const app = express();
 
 app.use(express.json({ limit: "2mb" }));
 
-// Polyfill Web APIs if missing (fixes "Headers is not defined" on Fly)
-if (typeof Headers === "undefined" || typeof fetch === "undefined") {
-  const undici = require("undici");
-  globalThis.fetch = undici.fetch;
-  globalThis.Headers = undici.Headers;
-  globalThis.Request = undici.Request;
-  globalThis.Response = undici.Response;
-}
+
 
 const Joi = require("joi");
 const { createClient } = require("@supabase/supabase-js");
