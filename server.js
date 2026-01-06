@@ -6,6 +6,38 @@ const Joi = require("joi");
 const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
+// ---- CORS (må ligge før routes og før express.json) ----
+const ALLOWED_ORIGINS = (process.env.CORS_ORIGINS || "*")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+
+  // Server-to-server/curl uten Origin: ingen CORS nødvendig
+  if (!origin) {
+    if (req.method === "OPTIONS") return res.status(204).end();
+    return next();
+  }
+
+  const allowAll = ALLOWED_ORIGINS.includes("*");
+  const allowOrigin = allowAll ? "*" : (ALLOWED_ORIGINS.includes(origin) ? origin : "");
+
+  if (allowOrigin) {
+    res.setHeader("Access-Control-Allow-Origin", allowOrigin);
+    if (allowOrigin !== "*") res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key");
+    res.setHeader("Access-Control-Max-Age", "86400");
+  }
+
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+
+  return next();
+});
 app.use(express.json({ limit: "2mb" }));
 
 // =========================
@@ -420,40 +452,85 @@ app.post("/api/eccairs/drafts/update", async (req, res) => {
 
 // =========================
 // Get URL to open in E2 UI
-// GET /api/eccairs/get-url?e2_id=OR-...
+// GET /api/eccairs/get-url?e2_id=OR-...&environment=sandbox|prod
+// If environment is missing, it will be resolved from eccairs_exports.
 // =========================
 app.get("/api/eccairs/get-url", async (req, res) => {
   try {
-    const { error, value } = getUrlSchema.validate(req.query || {});
-    if (error) {
-      return res.status(400).json({ ok: false, error: error.details[0].message });
-    }
+    const schema = Joi.object({
+      e2_id: Joi.string().required(),
+      environment: Joi.string().valid("sandbox", "prod").optional(),
+    });
+
+    const { error, value } = schema.validate(req.query || {});
+    if (error) return res.status(400).json({ ok: false, error: error.details[0].message });
 
     const { e2_id } = value;
+    let { environment } = value;
 
-    const token = await getE2AccessToken();
-    const base = process.env.E2_BASE_URL;
-
-    if (!base) {
+    if (!process.env.E2_BASE_URL) {
       return res.status(500).json({ ok: false, error: "E2_BASE_URL mangler i secrets" });
     }
 
-    const r = await fetch(`${base}/occurrences/get-URL/${encodeURIComponent(e2_id)}`, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: "application/json",
-      },
-    });
-
-    const j = await r.json().catch(() => ({}));
-
-    if (!r.ok) {
-      return res.status(r.status).json({ ok: false, error: "get-URL failed", details: j });
+    if (!supabase) {
+      return res.status(503).json({ ok: false, error: "Supabase er ikke konfigurert på serveren" });
     }
 
-    const url = j?.data?.url || j?.url || j?.data || null;
+    // Resolve environment if not provided (prefer DB truth)
+    if (!environment) {
+      const { data: expRow, error: expErr } = await supabase
+        .from("eccairs_exports")
+        .select("environment")
+        .eq("e2_id", e2_id)
+        .order("created_at", { ascending: false })
+        .maybeSingle();
 
-    return res.json({ ok: true, e2_id, url, raw: j });
+      if (expErr) {
+        return res.status(500).json({ ok: false, error: "Feil ved oppslag i eccairs_exports", details: expErr });
+      }
+      environment = expRow?.environment || "sandbox";
+    }
+
+    // NOTE: Here we rely on E2_BASE_URL already pointing to correct environment.
+    // If you later store both sandbox/prod base URLs, you can switch by env.
+    const base = process.env.E2_BASE_URL;
+
+    const token = await getE2AccessToken();
+
+    // Try both endpoint spellings (some deployments differ)
+    const endpoints = [
+      `${base}/occurrences/get-URL/${encodeURIComponent(e2_id)}`,
+      `${base}/occurrences/get-url/${encodeURIComponent(e2_id)}`,
+    ];
+
+    let lastJson = null;
+    let lastStatus = 500;
+
+    for (const url of endpoints) {
+      const r = await fetch(url, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/json",
+        },
+      });
+
+      const j = await r.json().catch(() => ({}));
+      lastJson = j;
+      lastStatus = r.status;
+
+      if (r.ok) {
+        const finalUrl = j?.data?.url || j?.url || j?.data || null;
+        return res.json({ ok: true, e2_id, environment, url: finalUrl, raw: j });
+      }
+    }
+
+    // If we get here, both endpoints failed
+    return res.status(lastStatus || 404).json({
+      ok: false,
+      error: "get-URL failed",
+      environment,
+      details: lastJson,
+    });
   } catch (err) {
     console.error("Feil i /api/eccairs/get-url:", err);
     return res.status(500).json({ ok: false, error: String(err.message || err) });
@@ -565,7 +642,7 @@ app.post("/eccairs/report", async (req, res) => {
     res.status(500).json({ error: "Noe gikk galt på serveren" });
   }
 });
-
+app.get("/health", (req, res) => res.json({ ok: true }));
 // =========================
 // Start server
 // =========================
