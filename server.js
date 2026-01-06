@@ -47,6 +47,11 @@ const draftsSchema = Joi.object({
   environment: Joi.string().valid("sandbox", "prod").default("sandbox"),
 });
 
+const draftsUpdateSchema = Joi.object({
+  incident_id: Joi.string().uuid().required(),
+  environment: Joi.string().valid("sandbox", "prod").default("sandbox"),
+});
+
 const getUrlSchema = Joi.object({
   e2_id: Joi.string().required(),
 });
@@ -55,6 +60,20 @@ const submitSchema = Joi.object({
   incident_id: Joi.string().uuid().required(),
   environment: Joi.string().valid("sandbox", "prod").default("sandbox"),
 });
+
+// =========================
+// Helpers
+// =========================
+const requireSupabase = (res) => {
+  if (!supabase) {
+    res.status(503).json({
+      ok: false,
+      error: "Supabase er ikke konfigurert på serveren",
+    });
+    return false;
+  }
+  return true;
+};
 
 // =========================
 // Health
@@ -81,12 +100,7 @@ app.post("/api/e2/token/test", async (req, res) => {
 // =========================
 app.post("/api/eccairs/drafts", async (req, res) => {
   try {
-    if (!supabase) {
-      return res.status(503).json({
-        ok: false,
-        error: "Supabase er ikke konfigurert på serveren",
-      });
-    }
+    if (!requireSupabase(res)) return;
 
     const { error, value } = draftsSchema.validate(req.body || {});
     if (error) {
@@ -266,6 +280,145 @@ app.post("/api/eccairs/drafts", async (req, res) => {
 });
 
 // =========================
+// Update ECCAIRS Draft with incident fields (MVP mapping)
+// POST /api/eccairs/drafts/update
+// body: { incident_id, environment }
+// NOTE: Endpoint path for E2 update may differ. If this fails with 404, we will adjust to correct E2 path.
+// =========================
+app.post("/api/eccairs/drafts/update", async (req, res) => {
+  try {
+    if (!requireSupabase(res)) return;
+
+    const { error, value } = draftsUpdateSchema.validate(req.body || {});
+    if (error) return res.status(400).json({ ok: false, error: error.details[0].message });
+
+    const { incident_id, environment } = value;
+
+    // 1) Find export row (must have e2_id)
+    const { data: exp, error: expErr } = await supabase
+      .from("eccairs_exports")
+      .select("*")
+      .eq("incident_id", incident_id)
+      .eq("environment", environment)
+      .maybeSingle();
+
+    if (expErr) {
+      return res.status(500).json({ ok: false, error: "Feil ved henting av eccairs_exports", details: expErr });
+    }
+    if (!exp?.e2_id) {
+      return res.status(400).json({ ok: false, error: "Ingen e2_id funnet. Opprett draft først." });
+    }
+
+    // 2) Load incident (adjust select fields to your schema)
+    const { data: incident, error: incErr } = await supabase
+      .from("incidents")
+      .select("id, company_id, title, description, occurred_at, created_at")
+      .eq("id", incident_id)
+      .single();
+
+    if (incErr || !incident) {
+      return res.status(404).json({ ok: false, error: "Incident ikke funnet" });
+    }
+
+    // 3) Load integration (for later mapping)
+    const { data: integration, error: intErr } = await supabase
+      .from("eccairs_integrations")
+      .select("*")
+      .eq("company_id", incident.company_id)
+      .eq("environment", environment)
+      .eq("enabled", true)
+      .maybeSingle();
+
+    if (intErr) {
+      return res.status(500).json({ ok: false, error: "Feil ved henting av eccairs_integrations", details: intErr });
+    }
+    if (!integration) {
+      return res.status(400).json({ ok: false, error: "ECCAIRS integrasjon mangler for company/env" });
+    }
+
+    // 4) Build payload (MVP)
+    // WARNING: Attribute codes are taxonomy dependent. This MVP just demonstrates updating a text field.
+    const text =
+      incident.description ||
+      incident.title ||
+      `Oppdatert fra AviSafe (${incident.id})`;
+
+    const payload = {
+      e2Id: exp.e2_id,
+      type: "OR",
+      status: "DRAFT",
+      taxonomyCodes: {
+        "24": {
+          ID: "ID00000000000000000000000000000001",
+          ATTRIBUTES: {
+            "425": [{ text }],
+          },
+          ENTITIES: {},
+        },
+      },
+    };
+
+    // 5) Call E2 update (path may differ in your E2 swagger)
+    const token = await getE2AccessToken();
+    const base = process.env.E2_BASE_URL;
+
+    if (!base) {
+      return res.status(500).json({ ok: false, error: "E2_BASE_URL mangler i secrets" });
+    }
+
+    const updRes = await fetch(`${base}/occurrences/update`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const updJson = await updRes.json().catch(() => ({}));
+
+    if (!updRes.ok) {
+      await supabase
+        .from("eccairs_exports")
+        .update({
+          status: "failed",
+          last_error:
+            updJson?.errorDetails ||
+            updJson?.message ||
+            `E2 update failed (${updRes.status})`,
+          response: updJson,
+          payload,
+          last_attempt_at: new Date().toISOString(),
+        })
+        .eq("id", exp.id);
+
+      return res.status(updRes.status).json({
+        ok: false,
+        error: "E2 update failed",
+        details: updJson,
+      });
+    }
+
+    await supabase
+      .from("eccairs_exports")
+      .update({
+        status: "draft_created",
+        last_error: null,
+        response: updJson,
+        payload,
+        last_attempt_at: new Date().toISOString(),
+      })
+      .eq("id", exp.id);
+
+    return res.json({ ok: true, e2_id: exp.e2_id, updated: true, raw: updJson });
+  } catch (err) {
+    console.error("Feil i /api/eccairs/drafts/update:", err);
+    return res.status(500).json({ ok: false, error: String(err.message || err) });
+  }
+});
+
+// =========================
 // Get URL to open in E2 UI
 // GET /api/eccairs/get-url?e2_id=OR-...
 // =========================
@@ -315,12 +468,7 @@ app.get("/api/eccairs/get-url", async (req, res) => {
 // =========================
 app.post("/api/eccairs/submit", async (req, res) => {
   try {
-    if (!supabase) {
-      return res.status(503).json({
-        ok: false,
-        error: "Supabase er ikke konfigurert på serveren",
-      });
-    }
+    if (!requireSupabase(res)) return;
 
     const { error, value } = submitSchema.validate(req.body || {});
     if (error) {
@@ -424,4 +572,4 @@ app.post("/eccairs/report", async (req, res) => {
 const port = process.env.PORT || 8080;
 app.listen(port, "0.0.0.0", () => {
   console.log(`Server kjører på port ${port}`);
-});
+}); 
