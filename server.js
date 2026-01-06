@@ -453,60 +453,33 @@ app.post("/api/eccairs/drafts/update", async (req, res) => {
 // =========================
 // Get URL to open in E2 UI
 // GET /api/eccairs/get-url?e2_id=OR-...&environment=sandbox|prod
-// If environment is missing, it will be resolved from eccairs_exports.
 // =========================
 app.get("/api/eccairs/get-url", async (req, res) => {
   try {
     const schema = Joi.object({
       e2_id: Joi.string().required(),
-      environment: Joi.string().valid("sandbox", "prod").optional(),
+      environment: Joi.string().valid("sandbox", "prod").default("sandbox"),
     });
 
     const { error, value } = schema.validate(req.query || {});
     if (error) return res.status(400).json({ ok: false, error: error.details[0].message });
 
-    const { e2_id } = value;
-    let { environment } = value;
-
-    if (!process.env.E2_BASE_URL) {
-      return res.status(500).json({ ok: false, error: "E2_BASE_URL mangler i secrets" });
-    }
-
-    if (!supabase) {
-      return res.status(503).json({ ok: false, error: "Supabase er ikke konfigurert på serveren" });
-    }
-
-    // Resolve environment if not provided (prefer DB truth)
-    if (!environment) {
-      const { data: expRow, error: expErr } = await supabase
-        .from("eccairs_exports")
-        .select("environment")
-        .eq("e2_id", e2_id)
-        .order("created_at", { ascending: false })
-        .maybeSingle();
-
-      if (expErr) {
-        return res.status(500).json({ ok: false, error: "Feil ved oppslag i eccairs_exports", details: expErr });
-      }
-      environment = expRow?.environment || "sandbox";
-    }
-
-    // NOTE: Here we rely on E2_BASE_URL already pointing to correct environment.
-    // If you later store both sandbox/prod base URLs, you can switch by env.
-    const base = process.env.E2_BASE_URL;
+    const { e2_id, environment } = value;
 
     const token = await getE2AccessToken();
+    const base = process.env.E2_BASE_URL;
+    if (!base) return res.status(500).json({ ok: false, error: "E2_BASE_URL mangler i secrets" });
 
-    // Try both endpoint spellings (some deployments differ)
-    const endpoints = [
-      `${base}/occurrences/get-URL/${encodeURIComponent(e2_id)}`,
-      `${base}/occurrences/get-url/${encodeURIComponent(e2_id)}`,
+    // IMPORTANT: E2 endpoints kan være case-sensitive. Prøv flere varianter.
+    const candidates = [
+      `${base}/occurrences/get-URL/${encodeURIComponent(e2_id)}`, // ofte i swagger
+      `${base}/occurrences/getUrl/${encodeURIComponent(e2_id)}`,  // noen API-er bruker camelCase
+      `${base}/occurrences/get-url/${encodeURIComponent(e2_id)}`, // din nåværende (feiler hos deg)
     ];
 
-    let lastJson = null;
-    let lastStatus = 500;
+    let last = null;
 
-    for (const url of endpoints) {
+    for (const url of candidates) {
       const r = await fetch(url, {
         headers: {
           Authorization: `Bearer ${token}`,
@@ -515,28 +488,28 @@ app.get("/api/eccairs/get-url", async (req, res) => {
       });
 
       const j = await r.json().catch(() => ({}));
-      lastJson = j;
-      lastStatus = r.status;
+      last = { url, status: r.status, body: j };
 
       if (r.ok) {
-        const finalUrl = j?.data?.url || j?.url || j?.data || null;
-        return res.json({ ok: true, e2_id, environment, url: finalUrl, raw: j });
+        // Normaliserer URL-felt uansett format
+        const openUrl = j?.data?.url || j?.url || j?.data || null;
+        return res.json({ ok: true, e2_id, environment, url: openUrl, raw: j, used: url });
       }
     }
 
-    // If we get here, both endpoints failed
-    return res.status(lastStatus || 404).json({
+    // Hvis alle feilet
+    return res.status(404).json({
       ok: false,
       error: "get-URL failed",
       environment,
-      details: lastJson,
+      details: last,
+      tried: candidates,
     });
   } catch (err) {
     console.error("Feil i /api/eccairs/get-url:", err);
     return res.status(500).json({ ok: false, error: String(err.message || err) });
   }
 });
-
 // =========================
 // OPTIONAL: Submit (future)
 // POST /api/eccairs/submit
