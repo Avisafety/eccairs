@@ -362,7 +362,132 @@ app.get("/api/eccairs/get-url", async (req, res) => {
     return res.status(500).json({ ok: false, error: String(err.message || err) });
   }
 });
+// =========================
+// Submit ECCAIRS report (change status)
+// POST /api/eccairs/submit
+// body: { incident_id, environment }
+// =========================
+app.post("/api/eccairs/submit", async (req, res) => {
+  try {
+    if (!requireAdminSupabase(res)) return;
 
+    const schema = Joi.object({
+      incident_id: Joi.string().uuid().required(),
+      environment: Joi.string().valid("sandbox", "prod").default("sandbox"),
+    });
+
+    const { error, value } = schema.validate(req.body || {});
+    if (error) return res.status(400).json({ ok: false, error: error.details[0].message });
+
+    const { incident_id, environment } = value;
+
+    // 0) RLS tilgangssjekk: brukeren må ha tilgang til incident
+    const userSb = makeUserSupabase(req.jwt);
+    if (!userSb) {
+      return res.status(500).json({
+        ok: false,
+        error: "SUPABASE_ANON_KEY mangler i gateway secrets (trengs for RLS-sjekk)",
+      });
+    }
+
+    const { data: incidentRls, error: rlsErr } = await userSb
+      .from("incidents")
+      .select("id, company_id")
+      .eq("id", incident_id)
+      .single();
+
+    if (rlsErr || !incidentRls) {
+      return res.status(403).json({ ok: false, error: "Ingen tilgang til incident (RLS)" });
+    }
+
+    // 1) Hent export row (må ha e2_id)
+    const { data: exp, error: expErr } = await supabaseAdmin
+      .from("eccairs_exports")
+      .select("*")
+      .eq("incident_id", incident_id)
+      .eq("environment", environment)
+      .maybeSingle();
+
+    if (expErr) {
+      return res.status(500).json({ ok: false, error: "Feil ved henting av eccairs_exports", details: expErr });
+    }
+    if (!exp?.e2_id) {
+      return res.status(400).json({ ok: false, error: "Ingen e2_id funnet. Opprett draft først." });
+    }
+
+    // 2) Øk attempts + mark attempt timestamp før kall
+    const nextAttempts = (exp.attempts || 0) + 1;
+    await supabaseAdmin
+      .from("eccairs_exports")
+      .update({
+        status: "pending",
+        attempts: nextAttempts,
+        last_attempt_at: new Date().toISOString(),
+        last_error: null,
+      })
+      .eq("id", exp.id);
+
+    // 3) Kall E2 change-status
+    const token = await getE2AccessToken();
+    const base = process.env.E2_BASE_URL;
+    if (!base) return res.status(500).json({ ok: false, error: "E2_BASE_URL mangler i secrets" });
+
+    // Swagger: POST /occurrences/change-status
+    // Vanlig mønster er body: { e2Id: "...", status: "SENT" }
+    // Hvis din swagger viser andre feltnavn, endrer vi etter første response.
+    const payload = { e2Id: exp.e2_id, status: "SENT" };
+
+    const r = await fetch(`${base}/occurrences/change-status`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const j = await r.json().catch(() => ({}));
+
+    if (!r.ok) {
+      await supabaseAdmin
+        .from("eccairs_exports")
+        .update({
+          status: "failed",
+          last_error: j?.errorDetails || j?.message || `E2 change-status failed (${r.status})`,
+          response: j,
+          payload,
+          last_attempt_at: new Date().toISOString(),
+        })
+        .eq("id", exp.id);
+
+      return res.status(r.status).json({ ok: false, error: "E2 change-status failed", details: j });
+    }
+
+    // 4) Oppdater export status => submitted
+    const { data: updated, error: updErr } = await supabaseAdmin
+      .from("eccairs_exports")
+      .update({
+        status: "submitted",
+        last_error: null,
+        response: j,
+        payload,
+        last_attempt_at: new Date().toISOString(),
+      })
+      .eq("id", exp.id)
+      .select("*")
+      .single();
+
+    if (updErr) {
+      return res.status(500).json({ ok: false, error: "Kunne ikke oppdatere eccairs_exports etter submit", details: updErr });
+    }
+
+    return res.json({ ok: true, incident_id, environment, e2_id: exp.e2_id, export: updated, raw: j });
+  } catch (err) {
+    console.error("Feil i /api/eccairs/submit:", err);
+    return res.status(500).json({ ok: false, error: String(err.message || err) });
+  }
+});
 // =========================
 // Start server
 // =========================
