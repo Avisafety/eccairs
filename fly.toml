@@ -2,15 +2,14 @@ app = "eccairs"
 primary_region = "ams"
 
 [http_service]
-auto_start_machines = true
-auto_stop_machines = true
-force_https = true
-internal_port = 8_080
-min_machines_running = 0
-processes = [ "app" ]
+  auto_start_machines = true
+  auto_stop_machines = false
+  force_https = true
+  internal_port = 8080
+  min_machines_running = 1
+  processes = ["app"]
 
 [[vm]]
-cpu_kind = "shared"
-cpus = 1
-memory = "1gb"
-memory_mb = 256
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "1gb"
