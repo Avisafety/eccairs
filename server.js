@@ -234,11 +234,17 @@ app.post("/api/eccairs/drafts", async (req, res) => {
       return res.status(500).json({ ok: false, error: "Kunne ikke oppdatere eccairs_exports", details: upErr });
     }
 
-   // 3) Build E2 payload fra incident + mapping
-const { payload, meta } = await buildE2DraftPayload({
-  supabaseAdmin,
-  incident_id,
+// 3) Build E2 payload fra incident + mapping + taxonomy
+const { payload, meta } = await buildE2Payload({
+  supabase: supabaseAdmin,
+  incident: { id: incident_id },
+  exportRow,
+  integration,
+  environment,
 });
+
+// Nyttig debug under testing
+console.log("E2 payload meta:", JSON.stringify(meta, null, 2));
 
 // Logg hva som faktisk ble sendt (nyttig i test)
 console.log("E2 payload meta:", meta);
