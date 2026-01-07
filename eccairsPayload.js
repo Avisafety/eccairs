@@ -1,52 +1,62 @@
 // eccairsPayload.js
-// Bygger E2 payload basert på:
-//  1) incident_eccairs_mappings (dine kolonner) OG/ELLER
-//  2) incident_eccairs_attributes (anbefalt, generic table) hvis du lager den senere
+// ---------------------------------------------
+// Bygger E2 payload basert på AviSafe-data
+// Støtter:
+//  - incident_eccairs_mappings (wide table)
+//  - evt. incident_eccairs_attributes (generic, senere)
 //
-// Viktig: Lovable bruker nå "431" (attribute code), ikke "VL431".
-// Derfor støtter vi direkte attribute codes, men tåler også "VL431" som fallback.
+// VIKTIG:
+// - Lovable lagrer attribute code som "431" (IKKE "VL431")
+// - Supabase-taxonomi bruker value_list_key = "VL431"
+// - E2 API forventer attributeCode = "431"
 //
-// Krever at Supabase taxonomi-tabell finnes:
-//  eccairs.value_list_items
-// med minst kolonnene: value_list_id (int), value_id (text)
+// Taxonomi-tabell:
+//   eccairs.value_list_items
+//     - value_list_key (text)  -> "VL431"
+//     - value_id        (text) -> "300"
+// ---------------------------------------------
 
+/**
+ * Normaliser attribute code
+ *  "431"   -> "431"
+ *  "VL431" -> "431"
+ */
 function toAttributeCode(codeOrVlKey) {
-  if (codeOrVlKey == null) return null;
-
+  if (!codeOrVlKey) return null;
   const s = String(codeOrVlKey).trim();
 
-  // "431" -> "431"
   if (/^\d+$/.test(s)) return s;
 
-  // "VL431" / "vl431" -> "431"
   const m = s.match(/^vl(\d+)$/i);
   if (m) return m[1];
 
   return null;
 }
 
-function ensureString(val) {
-  if (val == null) return null;
-  return String(val);
+function ensureString(v) {
+  if (v == null) return null;
+  return String(v);
 }
 
+/**
+ * E2 value-list format
+ *  { "431": [{ value: "300" }] }
+ */
 function asValueListAttr(valueId) {
-  // E2 value-list format: [{ value: "300" }]
   const v = ensureString(valueId);
   if (!v) return null;
   return [{ value: v }];
 }
 
 /**
- * Valider at (attributeCode,valueId) finnes i eccairs.value_list_items:
- *  value_list_id = attributeCode
- *  value_id      = valueId
+ * Valider at (attributeCode, valueId) finnes i taxonomi
+ * Matcher mot:
+ *   value_list_key = "VL" + attributeCode
+ *   value_id       = valueId
  */
 async function validateValueListSelections(supabase, selections) {
-  // selections: [{ code: "431", valueId: "300" }, ...]
   const valid = new Set();
 
-  // Gruppér per code for færre queries
   const byCode = new Map();
   for (const s of selections) {
     if (!s?.code || !s?.valueId) continue;
@@ -54,21 +64,21 @@ async function validateValueListSelections(supabase, selections) {
     byCode.get(s.code).add(String(s.valueId));
   }
 
-  // Kjør en query per code (MVP). Kan optimaliseres senere.
   for (const [code, valueSet] of byCode.entries()) {
+    const vlKey = `VL${code}`;
     const values = Array.from(valueSet);
 
     const { data, error } = await supabase
       .schema("eccairs")
       .from("value_list_items")
-      .select("value_list_id, value_id")
-      .eq("value_list_id", Number(code))
+      .select("value_list_key, value_id")
+      .eq("value_list_key", vlKey)
       .in("value_id", values);
 
     if (error) throw error;
 
     for (const row of data || []) {
-      valid.add(`${row.value_list_id}:${row.value_id}`);
+      valid.add(`${row.value_list_key}:${row.value_id}`);
     }
   }
 
@@ -76,11 +86,7 @@ async function validateValueListSelections(supabase, selections) {
 }
 
 /**
- * Les mapping fra din "wide table" incident_eccairs_mappings.
- * Tilpass select/listen til dine faktiske kolonner.
- *
- * Denne funksjonen antar at kolonneverdiene er VALUE_ID (f.eks. "300"),
- * og at vi vet hvilke attribute codes de hører til.
+ * Les fra "wide table" (nåværende løsning)
  */
 async function loadIncidentMappingsWide(supabase, incident_id) {
   const { data, error } = await supabase
@@ -94,69 +100,57 @@ async function loadIncidentMappingsWide(supabase, incident_id) {
 }
 
 /**
- * Hvis du senere lager en generic table:
- * incident_eccairs_attributes(incident_id uuid, attribute_code int, value_id text, text_value text, ...)
- * da kan gateway lese ALT uten hardkoding.
+ * Les fra generic table (valgfritt, fremtid)
  */
 async function loadIncidentAttributesGeneric(supabase, incident_id) {
   const { data, error } = await supabase
     .from("incident_eccairs_attributes")
-    .select("attribute_code, value_id, text_value")
+    .select("attribute_code, value_id")
     .eq("incident_id", incident_id);
 
   if (error) {
-    // Hvis tabellen ikke finnes enda, bare returner null uten å kræsje
-    // (Postgres: 42P01 undefined_table)
-    if (String(error.code) === "42P01") return null;
+    if (String(error.code) === "42P01") return null; // table missing
     throw error;
   }
   return data || [];
 }
 
 /**
- * Bygg selections-listen (attributeCode + valueId) fra:
- *  A) wide mapping (hardkodet) eller
- *  B) generic mapping (hvis finnes)
- *
- * Du sa Lovable bruker/lagrer 431, så vi bygger på attribute codes direkte.
+ * Bygg liste over { code, valueId }
  */
 async function buildSelections({ supabase, incident_id }) {
-  // 1) prøv generic table først (hvis du lager den)
   const generic = await loadIncidentAttributesGeneric(supabase, incident_id);
   if (generic && generic.length > 0) {
-    const selections = [];
-
-    for (const row of generic) {
-      const code = toAttributeCode(row.attribute_code);
-      const valueId = ensureString(row.value_id);
-      if (code && valueId) selections.push({ code, valueId });
-      // text_value støttes senere (da blir det ikke value-list)
-    }
-
-    return { selections, source: "incident_eccairs_attributes" };
+    return {
+      source: "incident_eccairs_attributes",
+      selections: generic
+        .map(r => ({
+          code: toAttributeCode(r.attribute_code),
+          valueId: ensureString(r.value_id),
+        }))
+        .filter(r => r.code && r.valueId),
+    };
   }
 
-  // 2) fallback: wide table (din nåværende)
   const wide = await loadIncidentMappingsWide(supabase, incident_id);
-  if (!wide) return { selections: [], source: "none" };
+  if (!wide) return { source: "none", selections: [] };
 
-  // HER er “koblingen” mellom dine kolonner og E2 attribute codes:
-  // occurrence_class -> 431
-  // phase_of_flight  -> 1072
-  // aircraft_category-> 17
   const selections = [];
-  if (wide.occurrence_class) selections.push({ code: "431", valueId: wide.occurrence_class });
-  if (wide.phase_of_flight) selections.push({ code: "1072", valueId: wide.phase_of_flight });
-  if (wide.aircraft_category) selections.push({ code: "17", valueId: wide.aircraft_category });
+  if (wide.occurrence_class)
+    selections.push({ code: "431", valueId: wide.occurrence_class });
+  if (wide.phase_of_flight)
+    selections.push({ code: "1072", valueId: wide.phase_of_flight });
+  if (wide.aircraft_category)
+    selections.push({ code: "17", valueId: wide.aircraft_category });
 
-  return { selections, source: "incident_eccairs_mappings" };
+  return { source: "incident_eccairs_mappings", selections };
 }
 
 /**
- * Bygg E2 payload. Vi validerer value-list valg mot taxonomien.
+ * HOVEDFUNKSJON
+ * Bygger korrekt E2 payload
  */
-async function buildE2Payload({ supabase, incident, exportRow, integration, environment }) {
-  // Base (minimal valid)
+async function buildE2Payload({ supabase, incident }) {
   const payload = {
     type: "REPORT",
     status: "DRAFT",
@@ -174,22 +168,22 @@ async function buildE2Payload({ supabase, incident, exportRow, integration, envi
     incident_id: incident.id,
   });
 
-  // Valider mot taxonomy-tabellen du lastet opp
   const validSet = await validateValueListSelections(supabase, selections);
 
   const attrs = {};
   const rejected = [];
 
   for (const sel of selections) {
-    const code = toAttributeCode(sel.code);
-    const valueId = ensureString(sel.valueId);
-    if (!code || !valueId) continue;
+    const code = sel.code;
+    const valueId = sel.valueId;
+    const key = `VL${code}:${valueId}`;
 
-    const key = `${Number(code)}:${valueId}`;
-    const ok = validSet.has(key);
-
-    if (!ok) {
-      rejected.push({ attribute_code: code, value_id: valueId, reason: "Not found in eccairs.value_list_items" });
+    if (!validSet.has(key)) {
+      rejected.push({
+        attribute_code: code,
+        value_id: valueId,
+        reason: "Not found in eccairs.value_list_items",
+      });
       continue;
     }
 
@@ -198,10 +192,17 @@ async function buildE2Payload({ supabase, incident, exportRow, integration, envi
 
   payload.taxonomyCodes["24"].ATTRIBUTES = attrs;
 
-  return { payload, meta: { source, rejected, selectionsCount: selections.length } };
+  return {
+    payload,
+    meta: {
+      source,
+      selectionsCount: selections.length,
+      rejected,
+    },
+  };
 }
 
 module.exports = {
-  toAttributeCode,
   buildE2Payload,
+  toAttributeCode,
 };
