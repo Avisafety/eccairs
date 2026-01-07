@@ -1,22 +1,26 @@
 // eccairsPayload.js
-// ---------------------------------------------
+// ----------------------------------------------------
 // Bygger E2 payload basert på AviSafe-data
 //
 // Støtter:
-//  - incident_eccairs_mappings (wide table)
-//  - incident_eccairs_attributes (generic table, valgfritt)
+//  - incident_eccairs_mappings (wide table – nåværende)
+//  - incident_eccairs_attributes (generic table – valgfritt / fremtid)
 //
-// VIKTIG:
+// VIKTIG (basert på faktisk E2-validering):
 // - Lovable lagrer attribute code som "431" (IKKE "VL431")
 // - Supabase-taxonomi bruker value_list_key = "VL431"
 // - E2 API forventer attributeCode = "431"
-// - E2 validering (i ditt miljø) forventer INTEGERS i ATTRIBUTES for value-lists
+// - E2 forventer INTEGER-arrays i ATTRIBUTES for value-lists
 //
-// Taxonomi-tabell (din):
+// Taxonomi-tabell (Supabase):
 //   eccairs.value_list_items
 //     - value_list_key (text)  -> "VL431"
 //     - value_id        (text) -> "300"
-// ---------------------------------------------
+//
+// Endring i denne versjonen:
+// - Ny robust batch-validering: validateValueListAttrsBatch()
+//   (grupperer per VL-key og bruker .in() per VL, i stedet for sårbar OR-hack)
+// ----------------------------------------------------
 
 /**
  * Normaliser attribute code
@@ -40,15 +44,13 @@ function toAttributeCode(codeOrVlKey) {
 
 function ensureString(v) {
   if (v == null) return null;
-  const s = String(v);
-  return s.trim() ? s : null;
+  const s = String(v).trim();
+  return s || null;
 }
 
 /**
- * E2 value-list format (per E2-valideringen du ser):
+ * E2 value-list format (det som FAKTISK funker):
  *   ATTRIBUTES["431"] = [200]
- *
- * Vi konverterer valueId til number og sender array.
  */
 function asE2ValueListAttr(valueId) {
   const s = ensureString(valueId);
@@ -61,42 +63,86 @@ function asE2ValueListAttr(valueId) {
 }
 
 /**
- * Valider at (attributeCode, valueId) finnes i taxonomi.
- * Matcher mot:
- *   value_list_key = "VL" + attributeCode
- *   value_id       = valueId
+ * Robust batch-validering av value-list attributter mot taxonomi-tabellen.
+ *
+ * For hver VL-key (VL{attribute_code}) kjører vi en egen query:
+ *  .eq('value_list_key', vlKey)
+ *  .in('value_id', [...])
+ *
+ * Returnerer en struktur som kan brukes til:
+ * - å bygge et Set med "VLxxx:valueId"
+ * - å gi strukturerte valideringsfeil
  */
-async function validateValueListSelections(supabase, selections) {
-  const valid = new Set();
+async function validateValueListAttrsBatch({ supabase, selections }) {
+  // selections: [{ code: "431", valueId: "200" }, ...]
+  const validSet = new Set();
+  const validationErrors = [];
 
-  // grupper per code
-  const byCode = new Map();
-  for (const sel of selections) {
-    if (!sel?.code || !sel?.valueId) continue;
-    const code = String(sel.code);
-    if (!byCode.has(code)) byCode.set(code, new Set());
-    byCode.get(code).add(String(sel.valueId));
+  if (!Array.isArray(selections) || selections.length === 0) {
+    return { ok: true, validSet, validationErrors };
   }
 
-  for (const [code, valueSet] of byCode.entries()) {
-    const vlKey = `VL${code}`;
-    const values = Array.from(valueSet);
+  // Group per VL key
+  // vlKey -> { values:Set<string>, checks:Array<{code,valueId}> }
+  const byVlKey = new Map();
 
-    const { data, error } = await supabase
+  for (const sel of selections) {
+    const code = toAttributeCode(sel?.code);
+    const valueId = ensureString(sel?.valueId);
+    if (!code || !valueId) continue;
+
+    const vlKey = `VL${code}`;
+
+    if (!byVlKey.has(vlKey)) byVlKey.set(vlKey, { values: new Set(), checks: [] });
+    const group = byVlKey.get(vlKey);
+    group.values.add(valueId);
+    group.checks.push({ code, valueId });
+  }
+
+  for (const [vlKey, group] of byVlKey.entries()) {
+    const values = Array.from(group.values);
+
+    const { data: validItems, error: valErr } = await supabase
       .schema("eccairs")
       .from("value_list_items")
       .select("value_list_key, value_id")
       .eq("value_list_key", vlKey)
       .in("value_id", values);
 
-    if (error) throw error;
+    if (valErr) {
+      // Hard fail: vi kan ikke stole på videre validering
+      return {
+        ok: false,
+        validSet,
+        validationErrors: [
+          {
+            attribute_code: null,
+            value_id: null,
+            reason: `Taxonomy validation query failed for ${vlKey}: ${valErr.message || String(valErr)}`,
+          },
+        ],
+      };
+    }
 
-    for (const row of data || []) {
-      valid.add(`${row.value_list_key}:${row.value_id}`);
+    // Fill validSet
+    for (const row of validItems || []) {
+      validSet.add(`${row.value_list_key}:${row.value_id}`);
+    }
+
+    // Find missing
+    for (const check of group.checks) {
+      const key = `${vlKey}:${check.valueId}`;
+      if (!validSet.has(key)) {
+        validationErrors.push({
+          attribute_code: check.code,
+          value_id: check.valueId,
+          reason: `Not found in eccairs.value_list_items for ${vlKey}`,
+        });
+      }
     }
   }
 
-  return valid;
+  return { ok: validationErrors.length === 0, validSet, validationErrors };
 }
 
 /**
@@ -105,7 +151,7 @@ async function validateValueListSelections(supabase, selections) {
 async function loadIncidentMappingsWide(supabase, incident_id) {
   const { data, error } = await supabase
     .from("incident_eccairs_mappings")
-    .select("incident_id, occurrence_class, phase_of_flight, aircraft_category")
+    .select("incident_id, occurrence_class, phase_of_flight, aircraft_category, responsible_entity")
     .eq("incident_id", incident_id)
     .maybeSingle();
 
@@ -114,7 +160,7 @@ async function loadIncidentMappingsWide(supabase, incident_id) {
 }
 
 /**
- * Les fra generic table (valgfritt)
+ * Les fra generic table (fremtid / valgfritt)
  */
 async function loadIncidentAttributesGeneric(supabase, incident_id) {
   const { data, error } = await supabase
@@ -123,7 +169,7 @@ async function loadIncidentAttributesGeneric(supabase, incident_id) {
     .eq("incident_id", incident_id);
 
   if (error) {
-    // 42P01 = undefined_table (hvis den ikke finnes enda)
+    // 42P01 = table does not exist
     if (String(error.code) === "42P01") return null;
     throw error;
   }
@@ -132,28 +178,30 @@ async function loadIncidentAttributesGeneric(supabase, incident_id) {
 }
 
 /**
- * Tillatte attribute codes i MVP for DRAFT CREATE.
- * Basert på feilen du fikk: 17/1072 ble avvist/feil format.
- *
- * Vi starter med 431 (occurrence class) for å få create til å lykkes.
+ * Tillatte attribute codes i CREATE (MVP)
+ * Utvides kontrollert etter hvert
  */
-const MVP_ALLOWED_CODES = new Set(["431"]);
+const MVP_ALLOWED_CODES = new Set([
+  "431", // Occurrence class
+  "453", // Responsible entity (f.eks. Norway = 133)
+  // Når du vil utvide: legg til "1072", "17", osv (men først når E2-formatet er bekreftet i ditt miljø)
+]);
 
 /**
- * Bygg liste over { code, valueId } fra:
- *  - generic (om finnes) ellers wide
+ * Bygg liste over { code, valueId }
  */
 async function buildSelections({ supabase, incident_id }) {
   const generic = await loadIncidentAttributesGeneric(supabase, incident_id);
   if (generic && generic.length > 0) {
-    const selections = generic
-      .map((r) => ({
-        code: toAttributeCode(r.attribute_code),
-        valueId: ensureString(r.value_id),
-      }))
-      .filter((r) => r.code && r.valueId);
-
-    return { source: "incident_eccairs_attributes", selections };
+    return {
+      source: "incident_eccairs_attributes",
+      selections: generic
+        .map((r) => ({
+          code: toAttributeCode(r.attribute_code),
+          valueId: ensureString(r.value_id),
+        }))
+        .filter((r) => r.code && r.valueId),
+    };
   }
 
   const wide = await loadIncidentMappingsWide(supabase, incident_id);
@@ -161,14 +209,17 @@ async function buildSelections({ supabase, incident_id }) {
 
   const selections = [];
 
-  // occurrence_class -> 431
+  // Occurrence class -> 431
   if (wide.occurrence_class) {
     selections.push({ code: "431", valueId: wide.occurrence_class });
   }
 
-  // Skipper disse foreløpig til vi har korrekt E2-format/placement:
-  // phase_of_flight  -> 1072
-  // aircraft_category-> 17
+  // Responsible entity -> 453 (f.eks. Norway = 133)
+  if (wide.responsible_entity) {
+    selections.push({ code: "453", valueId: wide.responsible_entity });
+  }
+
+  // Andre attributter (1072, 17, osv.) tas senere når E2-format er bekreftet
   // if (wide.phase_of_flight) selections.push({ code: "1072", valueId: wide.phase_of_flight });
   // if (wide.aircraft_category) selections.push({ code: "17", valueId: wide.aircraft_category });
 
@@ -177,7 +228,7 @@ async function buildSelections({ supabase, incident_id }) {
 
 /**
  * HOVEDFUNKSJON
- * Bygger E2 payload
+ * Bygger E2 payload for CREATE (DRAFT)
  */
 async function buildE2Payload({ supabase, incident }) {
   const payload = {
@@ -197,13 +248,13 @@ async function buildE2Payload({ supabase, incident }) {
     incident_id: incident.id,
   });
 
-  // Filtrer selections til MVP (kun 431) for å sikre create lykkes
+  // 1) Filter til MVP allowed + sanity checks
   const filtered = [];
   const rejected = [];
 
   for (const sel of selections) {
-    const code = toAttributeCode(sel.code);
-    const valueId = ensureString(sel.valueId);
+    const code = toAttributeCode(sel?.code);
+    const valueId = ensureString(sel?.valueId);
 
     if (!code || !valueId) continue;
 
@@ -211,7 +262,7 @@ async function buildE2Payload({ supabase, incident }) {
       rejected.push({
         attribute_code: code,
         value_id: valueId,
-        reason: "Skipped in MVP (not yet supported in create payload)",
+        reason: "Skipped (not yet supported in CREATE payload)",
       });
       continue;
     }
@@ -219,35 +270,54 @@ async function buildE2Payload({ supabase, incident }) {
     filtered.push({ code, valueId });
   }
 
-  // Valider mot taxonomi
-  const validSet = await validateValueListSelections(supabase, filtered);
+  // 2) Taxonomy validation (robust batch)
+  const { ok: taxOk, validSet, validationErrors } = await validateValueListAttrsBatch({
+    supabase,
+    selections: filtered,
+  });
 
+  if (!taxOk) {
+    // Ikke throw – returner meta som gjør feilsøk lett
+    return {
+      payload,
+      meta: {
+        source,
+        selectionsCount: selections.length,
+        usedCount: 0,
+        rejected: rejected.concat(validationErrors),
+        attributes: {},
+        taxonomyValidationFailed: true,
+      },
+    };
+  }
+
+  // 3) Build ATTRIBUTES with integer arrays
   const attrs = {};
-  for (const sel of filtered) {
-    const code = sel.code;
-    const valueId = sel.valueId;
 
-    const taxKey = `VL${code}:${valueId}`;
+  for (const sel of filtered) {
+    const vlKey = `VL${sel.code}`;
+    const taxKey = `${vlKey}:${sel.valueId}`;
+
     if (!validSet.has(taxKey)) {
       rejected.push({
-        attribute_code: code,
-        value_id: valueId,
-        reason: "Not found in eccairs.value_list_items (value_list_key/value_id mismatch)",
+        attribute_code: sel.code,
+        value_id: sel.valueId,
+        reason: "Not found in eccairs.value_list_items",
       });
       continue;
     }
 
-    const e2Val = asE2ValueListAttr(valueId);
+    const e2Val = asE2ValueListAttr(sel.valueId);
     if (!e2Val) {
       rejected.push({
-        attribute_code: code,
-        value_id: valueId,
-        reason: "Value is not numeric (cannot send as integer list to E2)",
+        attribute_code: sel.code,
+        value_id: sel.valueId,
+        reason: "Value is not numeric (E2 requires integer array)",
       });
       continue;
     }
 
-    attrs[code] = e2Val;
+    attrs[sel.code] = e2Val;
   }
 
   payload.taxonomyCodes["24"].ATTRIBUTES = attrs;
@@ -257,9 +327,9 @@ async function buildE2Payload({ supabase, incident }) {
     meta: {
       source,
       selectionsCount: selections.length,
-      usedCount: filtered.length,
+      usedCount: Object.keys(attrs).length,
       rejected,
-      attributes: attrs, // nyttig for debugging
+      attributes: attrs,
     },
   };
 }
