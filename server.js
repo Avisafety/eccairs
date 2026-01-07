@@ -6,6 +6,7 @@ const Joi = require("joi");
 const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
+const { buildE2Payload } = require("./eccairsPayload");
 
 // =========================
 // CORS (må ligge FØR routes)
@@ -233,18 +234,14 @@ app.post("/api/eccairs/drafts", async (req, res) => {
       return res.status(500).json({ ok: false, error: "Kunne ikke oppdatere eccairs_exports", details: upErr });
     }
 
-    // 3) Minimal E2 payload (alltid valid)
-    const payload = {
-      type: "REPORT",
-      status: "DRAFT",
-      taxonomyCodes: {
-        "24": {
-          ID: "ID00000000000000000000000000000001",
-          ATTRIBUTES: {},
-          ENTITIES: {},
-        },
-      },
-    };
+   // 3) Build E2 payload fra incident + mapping
+const { payload, meta } = await buildE2DraftPayload({
+  supabaseAdmin,
+  incident_id,
+});
+
+// Logg hva som faktisk ble sendt (nyttig i test)
+console.log("E2 payload meta:", meta);
 
     // 4) Call E2 create
     const token = await getE2AccessToken();
