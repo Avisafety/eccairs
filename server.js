@@ -333,6 +333,46 @@ app.post("/api/eccairs/drafts/update", async (req, res) => {
     details: updateJson,
   });
 }
+    // ✅ SUKSESS: oppdater exportRow med ny versjon hvis E2 returnerer den
+    const newVersion = updateJson?.data?.version ?? updateJson?.version ?? exportRow.e2_version ?? null;
+
+    const { data: updatedExport, error: updErr } = await supabaseAdmin
+      .from("eccairs_exports")
+      .update({
+        status: "draft_updated",
+        e2_version: newVersion,
+        payload,
+        response: updateJson,
+        last_error: null,
+        last_attempt_at: new Date().toISOString(),
+      })
+      .eq("id", exportRow.id)
+      .select("*")
+      .single();
+
+    if (updErr) {
+      return res.status(500).json({
+        ok: false,
+        error: "Kunne ikke oppdatere eccairs_exports etter edit",
+        details: updErr,
+      });
+    }
+
+    return res.json({
+      ok: true,
+      incident_id,
+      environment,
+      e2_id: exportRow.e2_id,
+      e2_version: updatedExport.e2_version,
+      export: updatedExport,
+      meta,
+      raw: updateJson,
+    });
+  } catch (err) {
+    console.error("Feil i /api/eccairs/drafts/update:", err);
+    return res.status(500).json({ ok: false, error: String(err.message || err) });
+  }
+}); // ✅ VIKTIG: lukker app.post("/api/eccairs/drafts/update"...)
 // =========================
 // Create ECCAIRS Draft (OR)
 // POST /api/eccairs/drafts
