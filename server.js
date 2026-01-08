@@ -677,19 +677,18 @@ app.post("/api/eccairs/submit", async (req, res) => {
       }
 
       return res.json({
-        ok: true,
-        incident_id,
-        environment,
-        e2_id: exp.e2_id,
-        export: updated,
-        raw: j,
-      });
-    } catch (err) {
-      console.error("Feil i /api/eccairs/submit:", err);
-      return res.status(500).json({ ok: false, error: String(err.message || err) });
-    }
-  }
-);
+  ok: true,
+  incident_id,
+  environment,
+  e2_id: exp.e2_id,
+  export: updated,
+  raw: j,
+});
+} catch (err) {
+  console.error("Feil i /api/eccairs/submit:", err);
+  return res.status(500).json({ ok: false, error: String(err.message || err) });
+}
+});
 // =========================
 // Start server
 // =========================
