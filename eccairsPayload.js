@@ -242,7 +242,19 @@ async function buildE2Payload({ supabase, incident }) {
       },
     },
   };
-
+const updateRes = await fetch(`${E2_BASE_URL}/occurrences/edit`, {
+  method: "PUT",
+  headers: {
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json",
+    Accept: "application/json",
+  },
+  body: JSON.stringify({
+    e2Id: exportRow.e2_id,
+    version: exportRow.e2_version,
+    ...payload, // taxonomyCodes osv.
+  }),
+});
   const { selections, source } = await buildSelections({
     supabase,
     incident_id: incident.id,
