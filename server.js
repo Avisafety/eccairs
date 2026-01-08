@@ -302,57 +302,37 @@ app.post("/api/eccairs/drafts/update", async (req, res) => {
     const updateJson = await updateRes.json().catch(() => ({}));
 
     if (!updateRes.ok) {
-      await supabaseAdmin
-        .from("eccairs_exports")
-        .update({
-          status: "failed",
-          last_error: updateJson?.errorDetails || updateJson?.message || `E2 edit failed (${updateRes.status})`,
-          response: updateJson,
-          payload,
-          last_attempt_at: new Date().toISOString(),
-        })
-        .eq("id", exportRow.id);
+  const errMsg =
+    updateJson?.errorDetails ||
+    updateJson?.message ||
+    updateJson?.error ||
+    `E2 edit failed (${updateRes.status})`;
 
-      return res.status(updateRes.status).json({ ok: false, error: "E2 edit failed", details: updateJson });
-    }
+  console.error("E2 EDIT FAILED", {
+    status: updateRes.status,
+    errMsg,
+    updateJson,
+  });
 
-    // 6) Oppdater e2_version fra respons (viktig!)
-    const newVersion = updateJson?.data?.version ?? updateJson?.version ?? null;
+  await supabaseAdmin
+    .from("eccairs_exports")
+    .update({
+      status: "failed",
+      last_error: errMsg,
+      response: updateJson,
+      payload,
+      last_attempt_at: new Date().toISOString(),
+    })
+    .eq("id", exportRow.id);
 
-    const { data: updatedExport, error: updErr } = await supabaseAdmin
-      .from("eccairs_exports")
-      .update({
-        status: "draft_updated",
-        e2_version: newVersion || exportRow.e2_version,
-        payload,
-        response: updateJson,
-        last_error: null,
-        last_attempt_at: new Date().toISOString(),
-      })
-      .eq("id", exportRow.id)
-      .select("*")
-      .single();
-
-    if (updErr) {
-      return res.status(500).json({ ok: false, error: "Kunne ikke oppdatere eccairs_exports etter edit", details: updErr });
-    }
-
-    return res.json({
-      ok: true,
-      incident_id,
-      environment,
-      e2_id: exportRow.e2_id,
-      e2_version: updatedExport.e2_version,
-      export: updatedExport,
-      meta,
-      raw: updateJson,
-    });
-  } catch (err) {
-    console.error("Feil i /api/eccairs/drafts/update:", err);
-    return res.status(500).json({ ok: false, error: String(err.message || err) });
-  }
-});
-
+  return res.status(updateRes.status).json({
+    ok: false,
+    error: "E2 edit failed",
+    status: updateRes.status,
+    message: errMsg,
+    details: updateJson,
+  });
+}
 // =========================
 // Create ECCAIRS Draft (OR)
 // POST /api/eccairs/drafts
