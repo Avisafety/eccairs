@@ -31,6 +31,7 @@ app.use((req, res, next) => {
   if (allowOrigin) {
     res.setHeader("Access-Control-Allow-Origin", allowOrigin);
     if (allowOrigin !== "*") res.setHeader("Vary", "Origin");
+    // Browser kaller kun GET/POST/OPTIONS mot gateway
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key");
     res.setHeader("Access-Control-Max-Age", "86400");
@@ -71,16 +72,18 @@ const { getE2AccessToken } = require("./e2Client");
 const draftsSchema = Joi.object({
   incident_id: Joi.string().uuid().required(),
   environment: Joi.string().valid("sandbox", "prod").default("sandbox"),
-});
+}).unknown(false);
+
+const draftsUpdateSchema = Joi.object({
+  incident_id: Joi.string().uuid().required(),
+  environment: Joi.string().valid("sandbox", "prod").default("sandbox"),
+}).unknown(false);
 
 const getUrlSchema = Joi.object({
   e2_id: Joi.string().required(),
   environment: Joi.string().valid("sandbox", "prod").default("sandbox"),
-});
-const draftsUpdateSchema = Joi.object({
-  incident_id: Joi.string().uuid().required(),
-  environment: Joi.string().valid("sandbox", "prod").default("sandbox"),
-});
+}).unknown(false);
+
 // =========================
 // Helpers
 // =========================
@@ -130,6 +133,53 @@ const makeUserSupabase = (jwt) => {
   });
 };
 
+// RLS tilgangssjekk for incident (bruker må ha tilgang)
+async function assertIncidentAccess({ jwt, incident_id }) {
+  const userSb = makeUserSupabase(jwt);
+  if (!userSb) {
+    return {
+      ok: false,
+      status: 500,
+      error: "SUPABASE_ANON_KEY mangler i gateway secrets (trengs for RLS-sjekk)",
+    };
+  }
+
+  const { data: incidentRls, error: rlsErr } = await userSb
+    .from("incidents")
+    .select("id, company_id")
+    .eq("id", incident_id)
+    .single();
+
+  if (rlsErr || !incidentRls) {
+    return { ok: false, status: 403, error: "Ingen tilgang til incident (RLS)" };
+  }
+
+  return { ok: true, incident: incidentRls };
+}
+
+// Finn aktiv integrasjon for company + env
+async function loadIntegration({ company_id, environment }) {
+  const { data: integration, error: intErr } = await supabaseAdmin
+    .from("eccairs_integrations")
+    .select("*")
+    .eq("company_id", company_id)
+    .eq("environment", environment)
+    .eq("enabled", true)
+    .maybeSingle();
+
+  if (intErr) {
+    return { ok: false, status: 500, error: "Feil ved henting av eccairs_integrations", details: intErr };
+  }
+  if (!integration) {
+    return {
+      ok: false,
+      status: 400,
+      error: "ECCAIRS integrasjon er ikke konfigurert for dette selskapet/miljøet",
+    };
+  }
+  return { ok: true, integration };
+}
+
 // =========================
 // Health
 // =========================
@@ -168,24 +218,9 @@ app.post("/api/eccairs/drafts/update", async (req, res) => {
 
     const { incident_id, environment } = value;
 
-    // 0) RLS tilgangssjekk (brukeren må ha tilgang til incident)
-    const userSb = makeUserSupabase(req.jwt);
-    if (!userSb) {
-      return res.status(500).json({
-        ok: false,
-        error: "SUPABASE_ANON_KEY mangler i gateway secrets (trengs for RLS-sjekk)",
-      });
-    }
-
-    const { data: incidentRls, error: rlsErr } = await userSb
-      .from("incidents")
-      .select("id, company_id")
-      .eq("id", incident_id)
-      .single();
-
-    if (rlsErr || !incidentRls) {
-      return res.status(403).json({ ok: false, error: "Ingen tilgang til incident (RLS)" });
-    }
+    // 0) RLS tilgangssjekk
+    const access = await assertIncidentAccess({ jwt: req.jwt, incident_id });
+    if (!access.ok) return res.status(access.status).json({ ok: false, error: access.error });
 
     // 1) Hent exportRow (må ha e2_id + e2_version)
     const { data: exportRow, error: expErr } = await supabaseAdmin
@@ -202,10 +237,27 @@ app.post("/api/eccairs/drafts/update", async (req, res) => {
       return res.status(400).json({ ok: false, error: "Ingen e2_id funnet. Opprett draft først." });
     }
     if (!exportRow?.e2_version) {
-      return res.status(400).json({ ok: false, error: "Ingen e2_version funnet. Opprett draft på nytt eller hent korrekt versjon." });
+      return res.status(400).json({
+        ok: false,
+        error: "Ingen e2_version funnet. Opprett draft på nytt eller hent korrekt versjon.",
+      });
     }
 
-    // 2) Oppdater attempts + status før kall
+    // 2) Hent integrasjon (samme som create)
+    const integrationRes = await loadIntegration({
+      company_id: exportRow.company_id,
+      environment,
+    });
+    if (!integrationRes.ok) {
+      return res.status(integrationRes.status).json({
+        ok: false,
+        error: integrationRes.error,
+        details: integrationRes.details,
+      });
+    }
+    const integration = integrationRes.integration;
+
+    // 3) Oppdater attempts + status før kall
     const nextAttempts = (exportRow.attempts || 0) + 1;
     await supabaseAdmin
       .from("eccairs_exports")
@@ -217,18 +269,18 @@ app.post("/api/eccairs/drafts/update", async (req, res) => {
       })
       .eq("id", exportRow.id);
 
-    // 3) Bygg payload på nytt (fra ny mapping/attributter)
+    // 4) Bygg payload på nytt
     const { payload, meta } = await buildE2Payload({
       supabase: supabaseAdmin,
       incident: { id: incident_id },
       exportRow,
-      integration: null, // hvis buildE2Payload ikke trenger den, ellers hent integration slik som create gjør
+      integration,
       environment,
     });
 
     console.log("E2 update payload meta:", JSON.stringify(meta, null, 2));
 
-    // 4) Call E2 edit (PUT)
+    // 5) Call E2 edit (PUT)
     const token = await getE2AccessToken();
     const base = process.env.E2_BASE_URL;
     if (!base) return res.status(500).json({ ok: false, error: "E2_BASE_URL mangler i secrets" });
@@ -264,7 +316,7 @@ app.post("/api/eccairs/drafts/update", async (req, res) => {
       return res.status(updateRes.status).json({ ok: false, error: "E2 edit failed", details: updateJson });
     }
 
-    // 5) Oppdater e2_version fra respons (viktig!)
+    // 6) Oppdater e2_version fra respons (viktig!)
     const newVersion = updateJson?.data?.version ?? updateJson?.version ?? null;
 
     const { data: updatedExport, error: updErr } = await supabaseAdmin
@@ -292,6 +344,7 @@ app.post("/api/eccairs/drafts/update", async (req, res) => {
       e2_id: exportRow.e2_id,
       e2_version: updatedExport.e2_version,
       export: updatedExport,
+      meta,
       raw: updateJson,
     });
   } catch (err) {
@@ -299,6 +352,7 @@ app.post("/api/eccairs/drafts/update", async (req, res) => {
     return res.status(500).json({ ok: false, error: String(err.message || err) });
   }
 });
+
 // =========================
 // Create ECCAIRS Draft (OR)
 // POST /api/eccairs/drafts
@@ -313,42 +367,25 @@ app.post("/api/eccairs/drafts", async (req, res) => {
 
     const { incident_id, environment } = value;
 
-    // 0) Sjekk at bruker har tilgang til incident via RLS (viktig!)
-    const userSb = makeUserSupabase(req.jwt);
-    if (!userSb) {
-      return res.status(500).json({
-        ok: false,
-        error: "SUPABASE_ANON_KEY mangler i gateway secrets (trengs for RLS-sjekk)",
-      });
-    }
+    // 0) RLS tilgangssjekk
+    const access = await assertIncidentAccess({ jwt: req.jwt, incident_id });
+    if (!access.ok) return res.status(access.status).json({ ok: false, error: access.error });
 
-    const { data: incidentRls, error: rlsErr } = await userSb
-      .from("incidents")
-      .select("id, company_id")
-      .eq("id", incident_id)
-      .single();
-
-    if (rlsErr || !incidentRls) {
-      return res.status(403).json({ ok: false, error: "Ingen tilgang til incident (RLS)" });
-    }
-
-    const incidentCompanyId = incidentRls.company_id;
+    const incidentCompanyId = access.incident.company_id;
 
     // 1) Finn integrasjon for company + env
-    const { data: integration, error: intErr } = await supabaseAdmin
-      .from("eccairs_integrations")
-      .select("*")
-      .eq("company_id", incidentCompanyId)
-      .eq("environment", environment)
-      .eq("enabled", true)
-      .maybeSingle();
-
-    if (intErr) {
-      return res.status(500).json({ ok: false, error: "Feil ved henting av eccairs_integrations", details: intErr });
+    const integrationRes = await loadIntegration({
+      company_id: incidentCompanyId,
+      environment,
+    });
+    if (!integrationRes.ok) {
+      return res.status(integrationRes.status).json({
+        ok: false,
+        error: integrationRes.error,
+        details: integrationRes.details,
+      });
     }
-    if (!integration) {
-      return res.status(400).json({ ok: false, error: "ECCAIRS integrasjon er ikke konfigurert for dette selskapet/miljøet" });
-    }
+    const integration = integrationRes.integration;
 
     // 2) Upsert eccairs_exports => pending (+ attempts)
     const nowIso = new Date().toISOString();
@@ -383,20 +420,16 @@ app.post("/api/eccairs/drafts", async (req, res) => {
       return res.status(500).json({ ok: false, error: "Kunne ikke oppdatere eccairs_exports", details: upErr });
     }
 
-// 3) Build E2 payload fra incident + mapping + taxonomy
-const { payload, meta } = await buildE2Payload({
-  supabase: supabaseAdmin,
-  incident: { id: incident_id },
-  exportRow,
-  integration,
-  environment,
-});
+    // 3) Build E2 payload
+    const { payload, meta } = await buildE2Payload({
+      supabase: supabaseAdmin,
+      incident: { id: incident_id },
+      exportRow,
+      integration,
+      environment,
+    });
 
-// Nyttig debug under testing
-console.log("E2 payload meta:", JSON.stringify(meta, null, 2));
-
-// Logg hva som faktisk ble sendt (nyttig i test)
-console.log("E2 payload meta:", meta);
+    console.log("E2 payload meta:", JSON.stringify(meta, null, 2));
 
     // 4) Call E2 create
     const token = await getE2AccessToken();
@@ -459,6 +492,7 @@ console.log("E2 payload meta:", meta);
       e2_id: e2Id,
       e2_version: e2Version,
       export: updatedExport,
+      meta,
       raw: createJson,
     });
   } catch (err) {
@@ -496,7 +530,6 @@ app.get("/api/eccairs/get-url", async (req, res) => {
     const j = await r.json().catch(() => ({}));
 
     if (!r.ok) {
-      // E2 returnCode=2 "not found" -> vi gir 404
       return res.status(404).json({
         ok: false,
         error: "get-URL failed",
@@ -514,6 +547,7 @@ app.get("/api/eccairs/get-url", async (req, res) => {
     return res.status(500).json({ ok: false, error: String(err.message || err) });
   }
 });
+
 // =========================
 // Submit ECCAIRS report (change status)
 // POST /api/eccairs/submit
@@ -526,31 +560,16 @@ app.post("/api/eccairs/submit", async (req, res) => {
     const schema = Joi.object({
       incident_id: Joi.string().uuid().required(),
       environment: Joi.string().valid("sandbox", "prod").default("sandbox"),
-    });
+    }).unknown(false);
 
     const { error, value } = schema.validate(req.body || {});
     if (error) return res.status(400).json({ ok: false, error: error.details[0].message });
 
     const { incident_id, environment } = value;
 
-    // 0) RLS tilgangssjekk: brukeren må ha tilgang til incident
-    const userSb = makeUserSupabase(req.jwt);
-    if (!userSb) {
-      return res.status(500).json({
-        ok: false,
-        error: "SUPABASE_ANON_KEY mangler i gateway secrets (trengs for RLS-sjekk)",
-      });
-    }
-
-    const { data: incidentRls, error: rlsErr } = await userSb
-      .from("incidents")
-      .select("id, company_id")
-      .eq("id", incident_id)
-      .single();
-
-    if (rlsErr || !incidentRls) {
-      return res.status(403).json({ ok: false, error: "Ingen tilgang til incident (RLS)" });
-    }
+    // 0) RLS tilgangssjekk
+    const access = await assertIncidentAccess({ jwt: req.jwt, incident_id });
+    if (!access.ok) return res.status(access.status).json({ ok: false, error: access.error });
 
     // 1) Hent export row (må ha e2_id)
     const { data: exp, error: expErr } = await supabaseAdmin
@@ -584,9 +603,6 @@ app.post("/api/eccairs/submit", async (req, res) => {
     const base = process.env.E2_BASE_URL;
     if (!base) return res.status(500).json({ ok: false, error: "E2_BASE_URL mangler i secrets" });
 
-    // Swagger: POST /occurrences/change-status
-    // Vanlig mønster er body: { e2Id: "...", status: "SENT" }
-    // Hvis din swagger viser andre feltnavn, endrer vi etter første response.
     const payload = { e2Id: exp.e2_id, status: "SENT" };
 
     const r = await fetch(`${base}/occurrences/change-status`, {
@@ -640,6 +656,7 @@ app.post("/api/eccairs/submit", async (req, res) => {
     return res.status(500).json({ ok: false, error: String(err.message || err) });
   }
 });
+
 // =========================
 // Start server
 // =========================
