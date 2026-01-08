@@ -459,14 +459,30 @@ app.post("/api/eccairs/drafts", async (req, res) => {
     if (!base) return res.status(500).json({ ok: false, error: "E2_BASE_URL mangler i secrets" });
 
     const createRes = await fetch(`${base}/occurrences/create`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-      body: JSON.stringify(payload),
-    });
+  method: "POST",
+  headers: {
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json",
+    Accept: "application/json",
+  },
+  body: JSON.stringify(payload),
+});
+
+// Les body som tekst først (E2 svarer ikke alltid med JSON)
+const rawText = await createRes.text();
+let createJson = {};
+try {
+  createJson = rawText ? JSON.parse(rawText) : {};
+} catch (_) {
+  createJson = { _nonJsonBody: rawText };
+}
+
+// ✅ ALLTID logg status + et utdrag av body
+console.log("E2 CREATE RESPONSE", {
+  status: createRes.status,
+  ok: createRes.ok,
+  body: createJson,
+});
 
     const createJson = await createRes.json().catch(() => ({}));
 
