@@ -6,7 +6,9 @@ const Joi = require("joi");
 const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
+
 const { buildE2Payload } = require("./eccairsPayload");
+const { getE2AccessToken } = require("./e2Client");
 
 // =========================
 // CORS (må ligge FØR routes)
@@ -31,7 +33,6 @@ app.use((req, res, next) => {
   if (allowOrigin) {
     res.setHeader("Access-Control-Allow-Origin", allowOrigin);
     if (allowOrigin !== "*") res.setHeader("Vary", "Origin");
-    // Browser kaller kun GET/POST/OPTIONS mot gateway
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key");
     res.setHeader("Access-Control-Max-Age", "86400");
@@ -46,11 +47,9 @@ app.use(express.json({ limit: "2mb" }));
 // =========================
 // Supabase
 // =========================
-const SUPABASE_URL =
-  process.env.SUPABASE_URL || "https://pmucsvrypogtttrajqxq.supabase.co";
-
+const SUPABASE_URL = process.env.SUPABASE_URL || "https://pmucsvrypogtttrajqxq.supabase.co";
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY; // <-- legg inn i Fly secrets
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 
 let supabaseAdmin = null;
 if (!SUPABASE_SERVICE_ROLE_KEY) {
@@ -60,11 +59,6 @@ if (!SUPABASE_SERVICE_ROLE_KEY) {
     auth: { persistSession: false },
   });
 }
-
-// =========================
-// E2 OAuth helper
-// =========================
-const { getE2AccessToken } = require("./e2Client");
 
 // =========================
 // Schemas
@@ -81,6 +75,11 @@ const draftsUpdateSchema = Joi.object({
 
 const getUrlSchema = Joi.object({
   e2_id: Joi.string().required(),
+  environment: Joi.string().valid("sandbox", "prod").default("sandbox"),
+}).unknown(false);
+
+const submitSchema = Joi.object({
+  incident_id: Joi.string().uuid().required(),
   environment: Joi.string().valid("sandbox", "prod").default("sandbox"),
 }).unknown(false);
 
@@ -101,6 +100,15 @@ const getBearerToken = (req) => {
   return m ? m[1] : null;
 };
 
+// Bruker-scoped Supabase client (RLS håndheves)
+const makeUserSupabase = (jwt) => {
+  if (!SUPABASE_ANON_KEY) return null;
+  return createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+    auth: { persistSession: false },
+    global: { headers: { Authorization: `Bearer ${jwt}` } },
+  });
+};
+
 // Auth middleware for /api/eccairs/*
 const requireAuth = async (req, res, next) => {
   // Valgfritt: server-to-server nøkkel
@@ -111,10 +119,9 @@ const requireAuth = async (req, res, next) => {
   const jwt = getBearerToken(req);
   if (!jwt) return res.status(401).json({ ok: false, error: "Missing Authorization: Bearer <token>" });
 
-  // Verifiser JWT mot Supabase Auth (bruk service role)
   if (!requireAdminSupabase(res)) return;
-  const { data, error } = await supabaseAdmin.auth.getUser(jwt);
 
+  const { data, error } = await supabaseAdmin.auth.getUser(jwt);
   if (error || !data?.user) {
     return res.status(401).json({ ok: false, error: "Invalid session token" });
   }
@@ -122,15 +129,6 @@ const requireAuth = async (req, res, next) => {
   req.user = data.user;
   req.jwt = jwt;
   return next();
-};
-
-// Bruker-scoped Supabase client (RLS håndheves)
-const makeUserSupabase = (jwt) => {
-  if (!SUPABASE_ANON_KEY) return null;
-  return createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-    auth: { persistSession: false },
-    global: { headers: { Authorization: `Bearer ${jwt}` } },
-  });
 };
 
 // RLS tilgangssjekk for incident (bruker må ha tilgang)
@@ -180,6 +178,21 @@ async function loadIntegration({ company_id, environment }) {
   return { ok: true, integration };
 }
 
+// Les E2-response robust (tekst først, parse JSON hvis mulig)
+async function readResponseBody(res) {
+  const rawText = await res.text().catch(() => "");
+  if (!rawText) return {};
+  try {
+    return JSON.parse(rawText);
+  } catch {
+    return { _nonJsonBody: rawText };
+  }
+}
+
+function pickErrMsg(j, fallback) {
+  return j?.errorDetails || j?.message || j?.error || fallback;
+}
+
 // =========================
 // Health
 // =========================
@@ -204,178 +217,6 @@ app.post("/api/e2/token/test", async (req, res) => {
 app.use("/api/eccairs", requireAuth);
 
 // =========================
-// Update ECCAIRS Draft (OR)
-// POST /api/eccairs/drafts/update
-// body: { incident_id, environment }
-// (henter e2_id + e2_version fra eccairs_exports)
-// =========================
-app.post("/api/eccairs/drafts/update", async (req, res) => {
-  try {
-    if (!requireAdminSupabase(res)) return;
-
-    const { error, value } = draftsUpdateSchema.validate(req.body || {});
-    if (error) return res.status(400).json({ ok: false, error: error.details[0].message });
-
-    const { incident_id, environment } = value;
-
-    // 0) RLS tilgangssjekk
-    const access = await assertIncidentAccess({ jwt: req.jwt, incident_id });
-    if (!access.ok) return res.status(access.status).json({ ok: false, error: access.error });
-
-    // 1) Hent exportRow (må ha e2_id + e2_version)
-    const { data: exportRow, error: expErr } = await supabaseAdmin
-      .from("eccairs_exports")
-      .select("*")
-      .eq("incident_id", incident_id)
-      .eq("environment", environment)
-      .maybeSingle();
-
-    if (expErr) {
-      return res.status(500).json({ ok: false, error: "Feil ved henting av eccairs_exports", details: expErr });
-    }
-    if (!exportRow?.e2_id) {
-      return res.status(400).json({ ok: false, error: "Ingen e2_id funnet. Opprett draft først." });
-    }
-    if (!exportRow?.e2_version) {
-      return res.status(400).json({
-        ok: false,
-        error: "Ingen e2_version funnet. Opprett draft på nytt eller hent korrekt versjon.",
-      });
-    }
-
-    // 2) Hent integrasjon (samme som create)
-    const integrationRes = await loadIntegration({
-      company_id: exportRow.company_id,
-      environment,
-    });
-    if (!integrationRes.ok) {
-      return res.status(integrationRes.status).json({
-        ok: false,
-        error: integrationRes.error,
-        details: integrationRes.details,
-      });
-    }
-    const integration = integrationRes.integration;
-
-    // 3) Oppdater attempts + status før kall
-    const nextAttempts = (exportRow.attempts || 0) + 1;
-    await supabaseAdmin
-      .from("eccairs_exports")
-      .update({
-        status: "pending",
-        attempts: nextAttempts,
-        last_attempt_at: new Date().toISOString(),
-        last_error: null,
-      })
-      .eq("id", exportRow.id);
-
-    // 4) Bygg payload på nytt
-    const { payload, meta } = await buildE2Payload({
-      supabase: supabaseAdmin,
-      incident: { id: incident_id },
-      exportRow,
-      integration,
-      environment,
-    });
-
-    console.log("E2 update payload meta:", JSON.stringify(meta, null, 2));
-
-    // 5) Call E2 edit (PUT)
-    const token = await getE2AccessToken();
-    const base = process.env.E2_BASE_URL;
-    if (!base) return res.status(500).json({ ok: false, error: "E2_BASE_URL mangler i secrets" });
-
-    const updateRes = await fetch(`${base}/occurrences/edit`, {
-      method: "PUT",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-      body: JSON.stringify({
-        e2Id: exportRow.e2_id,
-        version: exportRow.e2_version,
-        ...payload, // taxonomyCodes osv.
-      }),
-    });
-
-    const updateJson = await updateRes.json().catch(() => ({}));
-
-    if (!updateRes.ok) {
-  const errMsg =
-    updateJson?.errorDetails ||
-    updateJson?.message ||
-    updateJson?.error ||
-    `E2 edit failed (${updateRes.status})`;
-
-  console.error("E2 EDIT FAILED", {
-    status: updateRes.status,
-    errMsg,
-    updateJson,
-  });
-
-  await supabaseAdmin
-    .from("eccairs_exports")
-    .update({
-      status: "failed",
-      last_error: errMsg,
-      response: updateJson,
-      payload,
-      last_attempt_at: new Date().toISOString(),
-    })
-    .eq("id", exportRow.id);
-
-  return res.status(updateRes.status).json({
-    ok: false,
-    error: "E2 edit failed",
-    status: updateRes.status,
-    message: errMsg,
-    details: updateJson,
-  });
-}
-    // ✅ SUKSESS: oppdater exportRow med ny versjon hvis E2 returnerer den
-    const newVersion = updateJson?.data?.version ?? updateJson?.version ?? exportRow.e2_version ?? null;
-
-    const { data: updatedExport, error: updErr } = await supabaseAdmin
-      .from("eccairs_exports")
-      .update({
-        status: "draft_updated",
-        e2_version: newVersion,
-        payload,
-        response: updateJson,
-        last_error: null,
-        last_attempt_at: new Date().toISOString(),
-      })
-      .eq("id", exportRow.id)
-      .select("*")
-      .single();
-
-    if (updErr) {
-      return res.status(500).json({
-        ok: false,
-        error: "Kunne ikke oppdatere eccairs_exports etter edit",
-        details: updErr,
-      });
-    }
-
-    return res.json({
-      ok: true,
-      incident_id,
-      environment,
-      e2_id: exportRow.e2_id,
-      e2_version: updatedExport.e2_version,
-      export: updatedExport,
-      meta,
-      raw: updateJson,
-    });
-  } catch (err) {
-    console.error("Feil i /api/eccairs/drafts/update:", err);
-    return res.status(500).json({ ok: false, error: String(err.message || err) });
-  }
-}); 
-
-// ✅ VIKTIG: lukker app.post("/api/eccairs/drafts/update"...)
-// =========================
 // Create ECCAIRS Draft (OR)
 // POST /api/eccairs/drafts
 // body: { incident_id, environment }
@@ -395,11 +236,8 @@ app.post("/api/eccairs/drafts", async (req, res) => {
 
     const incidentCompanyId = access.incident.company_id;
 
-    // 1) Finn integrasjon for company + env
-    const integrationRes = await loadIntegration({
-      company_id: incidentCompanyId,
-      environment,
-    });
+    // 1) Integrasjon
+    const integrationRes = await loadIntegration({ company_id: incidentCompanyId, environment });
     if (!integrationRes.ok) {
       return res.status(integrationRes.status).json({
         ok: false,
@@ -459,50 +297,48 @@ app.post("/api/eccairs/drafts", async (req, res) => {
     if (!base) return res.status(500).json({ ok: false, error: "E2_BASE_URL mangler i secrets" });
 
     const createRes = await fetch(`${base}/occurrences/create`, {
-  method: "POST",
-  headers: {
-    Authorization: `Bearer ${token}`,
-    "Content-Type": "application/json",
-    Accept: "application/json",
-  },
-  body: JSON.stringify(payload),
-});
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
 
-// Les body som tekst først (E2 svarer ikke alltid med JSON)
-const rawText = await createRes.text();
-let createJson = {};
-try {
-  createJson = rawText ? JSON.parse(rawText) : {};
-} catch (_) {
-  createJson = { _nonJsonBody: rawText };
-}
+    const createJson = await readResponseBody(createRes);
 
-// ✅ ALLTID logg status + et utdrag av body
-console.log("E2 CREATE RESPONSE", {
-  status: createRes.status,
-  ok: createRes.ok,
-  body: createJson,
-});
-
-    const createJson = await createRes.json().catch(() => ({}));
+    console.log("E2 CREATE RESPONSE", {
+      status: createRes.status,
+      ok: createRes.ok,
+      body: createJson,
+    });
 
     if (!createRes.ok) {
+      const errMsg = pickErrMsg(createJson, `E2 create failed (${createRes.status})`);
+
       await supabaseAdmin
         .from("eccairs_exports")
         .update({
           status: "failed",
-          last_error: createJson?.errorDetails || createJson?.message || `E2 create failed (${createRes.status})`,
+          last_error: errMsg,
           response: createJson,
           payload,
           last_attempt_at: new Date().toISOString(),
         })
         .eq("id", exportRow.id);
 
-      return res.status(createRes.status).json({ ok: false, error: "E2 create failed", details: createJson });
+      return res.status(createRes.status).json({
+        ok: false,
+        error: "E2 create failed",
+        status: createRes.status,
+        message: errMsg,
+        details: createJson,
+      });
     }
 
-    const e2Id = createJson?.data?.e2Id || null;
-    const e2Version = createJson?.data?.version || null;
+    const e2Id = createJson?.data?.e2Id || createJson?.e2Id || null;
+    const e2Version = createJson?.data?.version || createJson?.version || null;
 
     const { data: updatedExport, error: updErr } = await supabaseAdmin
       .from("eccairs_exports")
@@ -540,9 +376,168 @@ console.log("E2 CREATE RESPONSE", {
 });
 
 // =========================
+// Update ECCAIRS Draft (OR)
+// POST /api/eccairs/drafts/update
+// body: { incident_id, environment }
+// =========================
+app.post("/api/eccairs/drafts/update", async (req, res) => {
+  try {
+    if (!requireAdminSupabase(res)) return;
+
+    const { error, value } = draftsUpdateSchema.validate(req.body || {});
+    if (error) return res.status(400).json({ ok: false, error: error.details[0].message });
+
+    const { incident_id, environment } = value;
+
+    // 0) RLS tilgangssjekk
+    const access = await assertIncidentAccess({ jwt: req.jwt, incident_id });
+    if (!access.ok) return res.status(access.status).json({ ok: false, error: access.error });
+
+    // 1) Hent exportRow
+    const { data: exportRow, error: expErr } = await supabaseAdmin
+      .from("eccairs_exports")
+      .select("*")
+      .eq("incident_id", incident_id)
+      .eq("environment", environment)
+      .maybeSingle();
+
+    if (expErr) {
+      return res.status(500).json({ ok: false, error: "Feil ved henting av eccairs_exports", details: expErr });
+    }
+    if (!exportRow?.e2_id) {
+      return res.status(400).json({ ok: false, error: "Ingen e2_id funnet. Opprett draft først." });
+    }
+    if (!exportRow?.e2_version) {
+      return res.status(400).json({ ok: false, error: "Ingen e2_version funnet. Opprett draft på nytt eller hent korrekt versjon." });
+    }
+
+    // 2) Integrasjon
+    const integrationRes = await loadIntegration({ company_id: exportRow.company_id, environment });
+    if (!integrationRes.ok) {
+      return res.status(integrationRes.status).json({
+        ok: false,
+        error: integrationRes.error,
+        details: integrationRes.details,
+      });
+    }
+    const integration = integrationRes.integration;
+
+    // 3) Oppdater attempts + status før kall
+    const nextAttempts = (exportRow.attempts || 0) + 1;
+    await supabaseAdmin
+      .from("eccairs_exports")
+      .update({
+        status: "pending",
+        attempts: nextAttempts,
+        last_attempt_at: new Date().toISOString(),
+        last_error: null,
+      })
+      .eq("id", exportRow.id);
+
+    // 4) Bygg payload
+    const { payload, meta } = await buildE2Payload({
+      supabase: supabaseAdmin,
+      incident: { id: incident_id },
+      exportRow,
+      integration,
+      environment,
+    });
+
+    console.log("E2 update payload meta:", JSON.stringify(meta, null, 2));
+
+    // 5) Call E2 edit (PUT)
+    const token = await getE2AccessToken();
+    const base = process.env.E2_BASE_URL;
+    if (!base) return res.status(500).json({ ok: false, error: "E2_BASE_URL mangler i secrets" });
+
+    const updateRes = await fetch(`${base}/occurrences/edit`, {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({
+        e2Id: exportRow.e2_id,
+        version: exportRow.e2_version,
+        ...payload,
+      }),
+    });
+
+    const updateJson = await readResponseBody(updateRes);
+
+    console.log("E2 EDIT RESPONSE", {
+      status: updateRes.status,
+      ok: updateRes.ok,
+      body: updateJson,
+    });
+
+    if (!updateRes.ok) {
+      const errMsg = pickErrMsg(updateJson, `E2 edit failed (${updateRes.status})`);
+
+      await supabaseAdmin
+        .from("eccairs_exports")
+        .update({
+          status: "failed",
+          last_error: errMsg,
+          response: updateJson,
+          payload,
+          last_attempt_at: new Date().toISOString(),
+        })
+        .eq("id", exportRow.id);
+
+      return res.status(updateRes.status).json({
+        ok: false,
+        error: "E2 edit failed",
+        status: updateRes.status,
+        message: errMsg,
+        details: updateJson,
+      });
+    }
+
+    const newVersion = updateJson?.data?.version ?? updateJson?.version ?? exportRow.e2_version ?? null;
+
+    const { data: updatedExport, error: updErr } = await supabaseAdmin
+      .from("eccairs_exports")
+      .update({
+        status: "draft_updated",
+        e2_version: newVersion,
+        payload,
+        response: updateJson,
+        last_error: null,
+        last_attempt_at: new Date().toISOString(),
+      })
+      .eq("id", exportRow.id)
+      .select("*")
+      .single();
+
+    if (updErr) {
+      return res.status(500).json({
+        ok: false,
+        error: "Kunne ikke oppdatere eccairs_exports etter edit",
+        details: updErr,
+      });
+    }
+
+    return res.json({
+      ok: true,
+      incident_id,
+      environment,
+      e2_id: exportRow.e2_id,
+      e2_version: updatedExport.e2_version,
+      export: updatedExport,
+      meta,
+      raw: updateJson,
+    });
+  } catch (err) {
+    console.error("Feil i /api/eccairs/drafts/update:", err);
+    return res.status(500).json({ ok: false, error: String(err.message || err) });
+  }
+});
+
+// =========================
 // Get URL to open in E2 UI
 // GET /api/eccairs/get-url?e2_id=OR-...&environment=sandbox|prod
-// Uses swagger path: /occurrences/get-URL/{e2Id}
 // =========================
 app.get("/api/eccairs/get-url", async (req, res) => {
   try {
@@ -555,7 +550,6 @@ app.get("/api/eccairs/get-url", async (req, res) => {
     const base = process.env.E2_BASE_URL;
     if (!base) return res.status(500).json({ ok: false, error: "E2_BASE_URL mangler i secrets" });
 
-    // Swagger sier: GET /occurrences/get-URL/{e2Id}
     const url = `${base}/occurrences/get-URL/${encodeURIComponent(e2_id)}`;
 
     const r = await fetch(url, {
@@ -565,10 +559,10 @@ app.get("/api/eccairs/get-url", async (req, res) => {
       },
     });
 
-    const j = await r.json().catch(() => ({}));
+    const j = await readResponseBody(r);
 
     if (!r.ok) {
-      return res.status(404).json({
+      return res.status(r.status).json({
         ok: false,
         error: "get-URL failed",
         environment,
@@ -595,12 +589,7 @@ app.post("/api/eccairs/submit", async (req, res) => {
   try {
     if (!requireAdminSupabase(res)) return;
 
-    const schema = Joi.object({
-      incident_id: Joi.string().uuid().required(),
-      environment: Joi.string().valid("sandbox", "prod").default("sandbox"),
-    }).unknown(false);
-
-    const { error, value } = schema.validate(req.body || {});
+    const { error, value } = submitSchema.validate(req.body || {});
     if (error) return res.status(400).json({ ok: false, error: error.details[0].message });
 
     const { incident_id, environment } = value;
@@ -609,7 +598,7 @@ app.post("/api/eccairs/submit", async (req, res) => {
     const access = await assertIncidentAccess({ jwt: req.jwt, incident_id });
     if (!access.ok) return res.status(access.status).json({ ok: false, error: access.error });
 
-    // 1) Hent export row (må ha e2_id)
+    // 1) Hent export row
     const { data: exp, error: expErr } = await supabaseAdmin
       .from("eccairs_exports")
       .select("*")
@@ -653,21 +642,29 @@ app.post("/api/eccairs/submit", async (req, res) => {
       body: JSON.stringify(payload),
     });
 
-    const j = await r.json().catch(() => ({}));
+    const j = await readResponseBody(r);
+
+    console.log("E2 CHANGE-STATUS RESPONSE", {
+      status: r.status,
+      ok: r.ok,
+      body: j,
+    });
 
     if (!r.ok) {
+      const errMsg = pickErrMsg(j, `E2 change-status failed (${r.status})`);
+
       await supabaseAdmin
         .from("eccairs_exports")
         .update({
           status: "failed",
-          last_error: j?.errorDetails || j?.message || `E2 change-status failed (${r.status})`,
+          last_error: errMsg,
           response: j,
           payload,
           last_attempt_at: new Date().toISOString(),
         })
         .eq("id", exp.id);
 
-      return res.status(r.status).json({ ok: false, error: "E2 change-status failed", details: j });
+      return res.status(r.status).json({ ok: false, error: "E2 change-status failed", details: j, message: errMsg });
     }
 
     // 4) Oppdater export status => submitted
@@ -705,6 +702,7 @@ app.post("/api/eccairs/submit", async (req, res) => {
     return res.status(500).json({ ok: false, error: String(err.message || err) });
   }
 });
+
 // =========================
 // Start server
 // =========================
