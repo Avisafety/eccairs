@@ -654,40 +654,40 @@ app.post("/api/eccairs/submit", async (req, res) => {
       return res.status(r.status).json({ ok: false, error: "E2 change-status failed", details: j });
     }
 
-         // 4) Oppdater export status => submitted
-      const { data: updated, error: updErr } = await supabaseAdmin
-        .from("eccairs_exports")
-        .update({
-          status: "submitted",
-          last_error: null,
-          response: j,
-          payload,
-          last_attempt_at: new Date().toISOString(),
-        })
-        .eq("id", exp.id)
-        .select("*")
-        .single();
+    // 4) Oppdater export status => submitted
+    const { data: updated, error: updErr } = await supabaseAdmin
+      .from("eccairs_exports")
+      .update({
+        status: "submitted",
+        last_error: null,
+        response: j,
+        payload,
+        last_attempt_at: new Date().toISOString(),
+      })
+      .eq("id", exp.id)
+      .select("*")
+      .single();
 
-      if (updErr) {
-        return res.status(500).json({
-          ok: false,
-          error: "Kunne ikke oppdatere eccairs_exports etter submit",
-          details: updErr,
-        });
-      }
+    if (updErr) {
+      return res.status(500).json({
+        ok: false,
+        error: "Kunne ikke oppdatere eccairs_exports etter submit",
+        details: updErr,
+      });
+    }
 
-      return res.json({
-  ok: true,
-  incident_id,
-  environment,
-  e2_id: exp.e2_id,
-  export: updated,
-  raw: j,
-});
-} catch (err) {
-  console.error("Feil i /api/eccairs/submit:", err);
-  return res.status(500).json({ ok: false, error: String(err.message || err) });
-}
+    return res.json({
+      ok: true,
+      incident_id,
+      environment,
+      e2_id: exp.e2_id,
+      export: updated,
+      raw: j,
+    });
+  } catch (err) {
+    console.error("Feil i /api/eccairs/submit:", err);
+    return res.status(500).json({ ok: false, error: String(err.message || err) });
+  }
 });
 // =========================
 // Start server
