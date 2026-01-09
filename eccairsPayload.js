@@ -119,7 +119,7 @@ async function buildSelections({ supabase, incident_id, company_id }) {
     });
   }
 
-  // Handle Aircraft Category (17)
+  // Handle Aircraft Category (17) - Verify if it needs to be a nested entity
   if (wide.aircraft_category) {
     selections.push({
       code: "17",
@@ -171,12 +171,18 @@ function selectionToE2Value(sel) {
     return [{ value: n }];
   }
 
+  // Handle date_array format
+  if (sel.format === "date_array") {
+    if (!sel.text) return null;
+    return [{ value: sel.text }]; // ISO-8601 date string
+  }
+
   // fallback: if unknown format and raw provided, use raw
   if (sel.raw) return sel.raw;
 
   // last resort: try int-array
   const n = asInt(sel.valueId);
-  return n == null ? null : [n];
+  return n == null ? null : [{ value: n }];
 }
 
 // -------------------------
