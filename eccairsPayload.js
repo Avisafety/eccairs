@@ -1,4 +1,5 @@
 // Schema-aware payload builder for E2 (ECCAIRS2 / E2)
+// Versjon 2.0 - Oppdatert til korrekt E2 API-format
 
 function toAttributeCode(codeOrVlKey) {
   if (codeOrVlKey == null) return null;
@@ -21,7 +22,7 @@ function asInt(v) {
   if (!s) return null;
   const n = Number(s);
   if (!Number.isFinite(n)) return null;
-  return n;
+  return Math.floor(n); // Sikre heltall
 }
 
 // -------------------------
@@ -60,6 +61,27 @@ async function validateValueListSelections(supabase, selections) {
 }
 
 // -------------------------
+// Hent value description fra eccairs.value_list_items
+// -------------------------
+async function getValueDescription(supabase, vlKey, valueId) {
+  if (!vlKey || valueId == null) return null;
+  
+  const { data, error } = await supabase
+    .schema("eccairs")
+    .from("value_list_items")
+    .select("value_description")
+    .eq("value_list_key", vlKey)
+    .eq("value_id", String(valueId))
+    .maybeSingle();
+
+  if (error) {
+    console.warn(`Failed to get description for ${vlKey}:${valueId}`, error);
+    return null;
+  }
+  return data?.value_description || null;
+}
+
+// -------------------------
 // Loaders
 // -------------------------
 async function loadIncidentMappingsWide(supabase, incident_id) {
@@ -84,7 +106,6 @@ async function loadIntegrationSettings(supabase, company_id) {
   return data || null;
 }
 
-// NEW: Load incident_eccairs_attributes (den manglende funksjonen!)
 async function loadIncidentAttributesGeneric(supabase, incident_id) {
   const { data, error } = await supabase
     .from("incident_eccairs_attributes")
@@ -92,7 +113,7 @@ async function loadIncidentAttributesGeneric(supabase, incident_id) {
     .eq("incident_id", incident_id);
 
   if (error) {
-    // Table might not exist
+    // Tabell finnes kanskje ikke
     if (String(error.code) === "42P01") return null;
     throw error;
   }
@@ -107,7 +128,7 @@ async function buildSelections({ supabase, incident_id, company_id }) {
 
   // Prioriter incident_eccairs_attributes hvis de finnes
   if (generic && generic.length > 0) {
-    const selections = []; // <-- FIKSET: Manglende array definisjon
+    const selections = [];
 
     for (const r of generic) {
       const code = toAttributeCode(r.attribute_code);
@@ -136,7 +157,8 @@ async function buildSelections({ supabase, incident_id, company_id }) {
   const selections = [];
 
   // Handle Occurrence Class (431) - påkrevd
-  const validOccurrenceClasses = [100, 200, 300, 301, 302];
+  // Gyldige verdier ifølge E2 API: 100, 200, 300, 301, 302, 400, 500, 501, 502
+  const validOccurrenceClasses = [100, 200, 300, 301, 302, 400, 500, 501, 502];
   const occurrenceClass = validOccurrenceClasses.includes(wide.occurrence_class) 
     ? wide.occurrence_class 
     : 100; // Default: Occurrence
@@ -148,13 +170,16 @@ async function buildSelections({ supabase, incident_id, company_id }) {
     valueId: String(occurrenceClass)
   });
 
-  // Handle Phase of Flight (1072)
+  // Handle Phase of Flight (1072) - krever content-objekt
   if (wide.phase_of_flight) {
+    // Hent beskrivelse for content-feltet
+    const description = await getValueDescription(supabase, 'VL1072', wide.phase_of_flight);
     selections.push({
       code: "1072",
       taxonomy_code: "24",
-      format: "value_list_int_array",
-      valueId: String(wide.phase_of_flight)
+      format: "content_object_array",  // Spesialformat for 1072
+      valueId: String(wide.phase_of_flight),
+      text: description || ""
     });
   }
 
@@ -169,8 +194,7 @@ async function buildSelections({ supabase, incident_id, company_id }) {
   }
 
   // Handle Responsible Entity (453) - fra integration settings
-  // Bruk responsible_entity_id (integer) eller fall tilbake til 133 (Norway)
-  const responsibleEntity = integration?.responsible_entity_id || 133;
+  const responsibleEntity = integration?.responsible_entity_id || 133; // Default: Norway
   selections.push({
     code: "453",
     taxonomy_code: "24",
@@ -183,6 +207,7 @@ async function buildSelections({ supabase, incident_id, company_id }) {
 
 // -------------------------
 // Convert selection -> E2 attribute payload value
+// Basert på ECCAIRS 2.0 API Guide v4.26
 // -------------------------
 function selectionToE2Value(sel) {
   // Raw JSON override - bruk direkte
@@ -190,40 +215,81 @@ function selectionToE2Value(sel) {
     return sel.raw;
   }
 
-  // Text content array (f.eks. narrativer)
+  // Text content array (for narrativer som ren tekst)
+  // E2 format: [{ "text": "..." }]
   if (sel.format === "text_content_array") {
     if (!sel.text) return null;
-    return [{ content: sel.text }];
+    return [{ text: sel.text }];
+  }
+
+  // Content object array (for 1072 Phase of Flight etc.)
+  // E2 format: [{ "content": "..." }] eller [{ "content": [n] }]
+  if (sel.format === "content_object_array") {
+    if (sel.text) {
+      return [{ content: sel.text }];
+    }
+    const n = asInt(sel.valueId);
+    if (n == null) return null;
+    return [{ content: [n] }];
+  }
+
+  // Value-list integer array (standard for 431, 453, 17, 430, etc.)
+  // E2 format: [n] - IKKE [{ value: n }]!
+  if (sel.format === "value_list_int_array") {
+    const n = asInt(sel.valueId);
+    if (n == null) return null;
+    return [n];  // RIKTIG E2 FORMAT
+  }
+
+  // Multiple value-list integers
+  // E2 format: [n1, n2, n3]
+  if (sel.format === "value_list_int_multi_array") {
+    if (!sel.raw || !Array.isArray(sel.raw)) return null;
+    return sel.raw.map(v => asInt(v)).filter(n => n != null);
+  }
+
+  // Date format (YYYY-MM-DD)
+  // E2 format: ["2024-01-15"]
+  if (sel.format === "date_array" || sel.format === "local_date") {
+    if (!sel.text) return null;
+    return [sel.text];  // ISO-8601 dato som string i array
+  }
+
+  // Time format (HH:MM:SS)
+  // E2 format: ["14:30:00"]
+  if (sel.format === "time_array" || sel.format === "local_time") {
+    if (!sel.text) return null;
+    return [sel.text];
+  }
+
+  // Unit-value format (for 176, 310 etc.)
+  // E2 format: [{ "unit": "m", "content": "100" }]
+  if (sel.format === "unit_content_array") {
+    if (!sel.raw) return null;
+    return Array.isArray(sel.raw) ? sel.raw : [sel.raw];
+  }
+
+  // String array (for enkle tekst-attributter)
+  // E2 format: ["tekst"]
+  if (sel.format === "string_array") {
+    if (!sel.text) return null;
+    return [sel.text];
   }
 
   // Object array (for komplekse strukturer)
   if (sel.format === "object_array") {
-    if (sel.raw) return sel.raw;
+    if (sel.raw) return Array.isArray(sel.raw) ? sel.raw : [sel.raw];
     const n = asInt(sel.valueId);
     if (n == null) return null;
-    return [{ value: n }];
-  }
-
-  // Value-list int array (standard format for de fleste attributter)
-  if (sel.format === "value_list_int_array") {
-    const n = asInt(sel.valueId);
-    if (n == null) return null;
-    return [{ value: n }];
-  }
-
-  // Date format (YYYY-MM-DD)
-  if (sel.format === "date_array" || sel.format === "local_date") {
-    if (!sel.text) return null;
-    // E2 forventer ISO-8601 dato
-    return [{ value: sel.text }];
+    return [n];
   }
 
   // Fallback: hvis ukjent format og raw finnes, bruk raw
   if (sel.raw) return sel.raw;
 
-  // Last resort: prøv int-array med riktig format
+  // Last resort: prøv integer-array (korrekt E2 format)
   const n = asInt(sel.valueId);
-  return n == null ? null : [{ value: n }]; // FIKSET: Var [n], nå [{ value: n }]
+  return n == null ? null : [n];
 }
 
 // -------------------------
@@ -291,11 +357,12 @@ async function buildE2Payload({ supabase, incident, exportRow, integration, envi
 
   taxBlock["24"].ATTRIBUTES = attrs;
 
+  // Bygg payload i henhold til E2 API spec
   const payload = {
     type: "REPORT",
     status: "DRAFT",
     taxonomy_codes: taxBlock,
-    taxonomyCodes: taxBlock,
+    taxonomyCodes: taxBlock,  // Begge for kompatibilitet
   };
 
   const meta = {
@@ -319,8 +386,10 @@ async function buildE2Payload({ supabase, incident, exportRow, integration, envi
 module.exports = {
   buildE2Payload,
   toAttributeCode,
-  // Eksporter også hjelpefunksjoner for testing
+  // Eksporter hjelpefunksjoner for testing/debugging
   loadIncidentAttributesGeneric,
   loadIntegrationSettings,
+  getValueDescription,
   selectionToE2Value,
+  validateValueListSelections,
 };
