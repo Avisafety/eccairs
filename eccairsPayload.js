@@ -1,6 +1,6 @@
 // ECCAIRS2 E2 API Payload Builder
 // Oppdatert for korrekt JSON-struktur per API Guide v4.26
-// Synkronisert med Lovable frontend config
+// Støtter CREATE, EDIT og DELETE operasjoner
 
 function toAttributeCode(codeOrVlKey) {
   if (codeOrVlKey == null) return null;
@@ -30,6 +30,14 @@ function asInt(v) {
 function generateEntityId(suffix = "1") {
   const id = "ID" + String(suffix).padStart(32, "0");
   return id.slice(0, 34);
+}
+
+// Bestem rapport-type fra e2Id prefix
+function getReportType(e2Id) {
+  if (!e2Id) return 'OR';
+  if (e2Id.startsWith('VR-')) return 'VR';
+  if (e2Id.startsWith('OC-')) return 'OC';
+  return 'OR';
 }
 
 // -------------------------
@@ -120,7 +128,7 @@ async function buildSelections({ supabase, incident_id, company_id }) {
         valueId: ensureString(r.value_id),
         text: ensureString(r.text_value),
         raw: r.payload_json || null,
-        entity_path: r.entity_path || null,  // NYTT: Les entity_path fra database
+        entity_path: r.entity_path || null,
       });
     }
     return { source: "incident_eccairs_attributes", selections };
@@ -135,8 +143,8 @@ async function buildSelections({ supabase, incident_id, company_id }) {
 
   // 431 - Occurrence Class (påkrevd, top-level)
   const validOccurrenceClasses = [100, 200, 300, 301, 302, 400, 500, 501, 502];
-  const occurrenceClass = validOccurrenceClasses.includes(Number(wide.occurrence_class)) 
-    ? Number(wide.occurrence_class) 
+  const occurrenceClass = validOccurrenceClasses.includes(Number(wide.occurrence_class))
+    ? Number(wide.occurrence_class)
     : 300;
   selections.push({
     code: "431",
@@ -156,23 +164,23 @@ async function buildSelections({ supabase, incident_id, company_id }) {
     valueId: String(responsibleEntity)
   });
 
-  // 1072 - Detection Phase (FIKSET: content_object_array med integer)
+  // 1072 - Detection Phase
   if (wide.phase_of_flight) {
     selections.push({
       code: "1072",
       taxonomy_code: "24",
       entity_path: null,
-      format: "content_object_array",  // FIKSET: Riktig format-navn
-      valueId: String(wide.phase_of_flight)  // Integer ID, ikke tekst!
+      format: "content_object_array",
+      valueId: String(wide.phase_of_flight)
     });
   }
 
-  // 32 - Aircraft Category (FIKSET: Entity 4, ikke Entity 1!)
+  // 32 - Aircraft Category (Entity 4)
   if (wide.aircraft_category) {
     selections.push({
-      code: "32",  // FIKSET: Var 17, nå 32
+      code: "32",
       taxonomy_code: "24",
-      entity_path: "4",  // FIKSET: Aircraft entity (var "1")
+      entity_path: "4",
       format: "value_list_int_array",
       valueId: String(wide.aircraft_category)
     });
@@ -190,12 +198,11 @@ function selectionToE2Value(sel) {
     return sel.raw;
   }
 
-  // 2. Content object array - FIKSET: content må være integer array
-  // Brukes for: 1072 (Detection Phase), 454, etc.
+  // 2. Content object array - content må være integer array
   if (sel.format === "content_object_array") {
     const n = asInt(sel.valueId);
     if (n == null) return null;
-    return [{ content: [n] }];  // RIKTIG: [{"content": [10]}], ikke [{"content": ["Approach"]}]
+    return [{ content: [n] }];
   }
 
   // 3. Text content array (for narrativer, 1087 etc.)
@@ -208,25 +215,25 @@ function selectionToE2Value(sel) {
   if (sel.format === "value_list_int_array") {
     const n = asInt(sel.valueId);
     if (n == null) return null;
-    return [n];  // RIKTIG: [200], ikke [{"value": 200}]
+    return [n];
   }
 
   // 5. Local date (433)
   if (sel.format === "local_date" || sel.format === "date_array") {
     if (!sel.text) return null;
-    return [sel.text];  // ["2024-01-15"]
+    return [sel.text];
   }
 
   // 6. String array (440 Location Name, etc.)
   if (sel.format === "string_array") {
     if (!sel.text) return null;
-    return [sel.text];  // ["Oslo"]
+    return [sel.text];
   }
 
   // 7. Time array (457 Local Time)
   if (sel.format === "time_array") {
     if (!sel.text) return null;
-    return [sel.text];  // ["14:30:00"]
+    return [sel.text];
   }
 
   // Fallback
@@ -236,28 +243,50 @@ function selectionToE2Value(sel) {
 }
 
 // -------------------------
+// Build DELETE request info
+// -------------------------
+function buildDeleteRequest({ e2Id, environment }) {
+  if (!e2Id) {
+    throw new Error('e2_id is required for delete operation');
+  }
+
+  const baseUrl = environment === 'prod'
+    ? 'https://api.aviationreporting.eu'
+    : 'https://api.intg-aviationreporting.eu';
+
+  const type = getReportType(e2Id);
+
+  return {
+    method: 'DELETE',
+    url: `${baseUrl}/occurrences/${type}/${e2Id}`,
+    headers: {
+      'Accept': 'application/json'
+    },
+    body: null, // DELETE må ha tom body per API-dokumentasjon
+    meta: {
+      e2Id,
+      type,
+      environment,
+      operation: 'delete'
+    }
+  };
+}
+
+// -------------------------
 // Main payload builder
 // -------------------------
-async function buildE2Payload({ supabase, incident, exportRow, integration, environment, mode }) {
-  const taxBlock = {
-    "24": {
-      ID: "ID00000000000000000000000000000001",
-      ATTRIBUTES: {},
-      ENTITIES: {},
-    },
-  };
-
-  const { selections, source } = await buildSelections({ 
-    supabase, 
+async function buildE2Payload({ supabase, incident, exportRow, integration, environment, mode, versionType }) {
+  const { selections, source } = await buildSelections({
+    supabase,
     incident_id: incident.id,
-    company_id: integration?.company_id || incident.company_id 
+    company_id: integration?.company_id || incident.company_id
   });
 
   const rejected = [];
   const topLevelAttrs = {};
-  const entityAttrs = {};  // Gruppert per entity_path
+  const entityAttrs = {};
 
-  const filtered = selections.filter((s) => 
+  const filtered = selections.filter((s) =>
     (ensureString(s.taxonomy_code) || "24") === "24"
   );
 
@@ -270,15 +299,14 @@ async function buildE2Payload({ supabase, incident, exportRow, integration, envi
   const validSet = await validateValueListSelections(supabase, valueListCandidates);
 
   for (const sel of filtered) {
-    // Valider value-list verdier mot eccairs.value_list_items
     if (sel.format === "value_list_int_array") {
       if (!sel.valueId) continue;
       const key = `VL${sel.code}:${sel.valueId}`;
       if (!validSet.has(key)) {
-        rejected.push({ 
-          attribute_code: sel.code, 
-          value_id: sel.valueId, 
-          reason: "Not found in eccairs.value_list_items" 
+        rejected.push({
+          attribute_code: sel.code,
+          value_id: sel.valueId,
+          reason: "Not found in eccairs.value_list_items"
         });
         continue;
       }
@@ -286,14 +314,13 @@ async function buildE2Payload({ supabase, incident, exportRow, integration, envi
 
     const v = selectionToE2Value(sel);
     if (v == null) {
-      rejected.push({ 
-        attribute_code: sel.code, 
-        reason: `No value for format=${sel.format}` 
+      rejected.push({
+        attribute_code: sel.code,
+        reason: `No value for format=${sel.format}`
       });
       continue;
     }
 
-    // FIKSET: Bruk entity_path fra database/selection
     if (sel.entity_path) {
       if (!entityAttrs[sel.entity_path]) entityAttrs[sel.entity_path] = {};
       entityAttrs[sel.entity_path][sel.code] = v;
@@ -302,37 +329,82 @@ async function buildE2Payload({ supabase, incident, exportRow, integration, envi
     }
   }
 
-  // Sett top-level attributter
-  taxBlock["24"].ATTRIBUTES = topLevelAttrs;
+  // Mode-basert payload-bygging
+  let payload;
+  const effectiveMode = mode || 'create';
 
-  // Bygg ENTITIES-struktur for nested attributter
-  for (const [entityPath, attrs] of Object.entries(entityAttrs)) {
-    if (Object.keys(attrs).length > 0) {
-      taxBlock["24"].ENTITIES[entityPath] = [{
-        ID: generateEntityId(entityPath),
-        ATTRIBUTES: attrs
-      }];
+  if (effectiveMode === 'edit' || effectiveMode === 'update') {
+    // ========================
+    // EDIT MODE - Oppdater eksisterende draft
+    // ========================
+    if (!exportRow?.e2_id) {
+      throw new Error('e2_id is required for edit mode');
     }
-  }
 
-  // Fjern tom ENTITIES hvis ingen entity-attributter
-  if (Object.keys(taxBlock["24"].ENTITIES).length === 0) {
-    delete taxBlock["24"].ENTITIES;
-  }
+    // Bygg taxonomyCodes UTEN top-level ID
+    const editTaxBlock = {
+      "24": {
+        ATTRIBUTES: topLevelAttrs,
+      }
+    };
 
-  const payload = {
-    type: "REPORT",
-    status: "DRAFT",
-    taxonomy_codes: taxBlock,
-    taxonomyCodes: taxBlock,
-  };
+    // Legg til ENTITIES kun hvis det er noen
+    if (Object.keys(entityAttrs).length > 0) {
+      editTaxBlock["24"].ENTITIES = {};
+      for (const [entityPath, attrs] of Object.entries(entityAttrs)) {
+        if (Object.keys(attrs).length > 0) {
+          editTaxBlock["24"].ENTITIES[entityPath] = [{
+            ID: generateEntityId(entityPath),
+            ATTRIBUTES: attrs
+          }];
+        }
+      }
+    }
+
+    payload = {
+      e2Id: exportRow.e2_id,
+      versionType: versionType || "DRAFT", // DRAFT, MINOR, eller MAJOR
+      taxonomyCodes: editTaxBlock,
+    };
+
+  } else {
+    // ========================
+    // CREATE MODE - Ny rapport
+    // ========================
+    const createTaxBlock = {
+      "24": {
+        ID: "ID00000000000000000000000000000001",
+        ATTRIBUTES: topLevelAttrs,
+      }
+    };
+
+    // Legg til ENTITIES kun hvis det er noen
+    if (Object.keys(entityAttrs).length > 0) {
+      createTaxBlock["24"].ENTITIES = {};
+      for (const [entityPath, attrs] of Object.entries(entityAttrs)) {
+        if (Object.keys(attrs).length > 0) {
+          createTaxBlock["24"].ENTITIES[entityPath] = [{
+            ID: generateEntityId(entityPath),
+            ATTRIBUTES: attrs
+          }];
+        }
+      }
+    }
+
+    payload = {
+      type: "REPORT",
+      status: "DRAFT",
+      taxonomyCodes: createTaxBlock,
+    };
+  }
 
   const meta = {
-    mode: mode || null,
+    mode: effectiveMode,
+    versionType: effectiveMode === 'edit' ? (versionType || 'DRAFT') : null,
     source,
     environment: environment || null,
     incident_id: incident?.id || null,
-    usedCount: Object.keys(topLevelAttrs).length + 
+    usedCount: Object.keys(topLevelAttrs).length +
       Object.values(entityAttrs).reduce((sum, a) => sum + Object.keys(a).length, 0),
     selectionsCount: selections.length,
     rejected,
@@ -340,8 +412,8 @@ async function buildE2Payload({ supabase, incident, exportRow, integration, envi
     entityAttributes: entityAttrs,
     export_id: exportRow?.id || null,
     company_id: integration?.company_id || null,
-    e2Id: exportRow?.e2_id,
-    e2Version: exportRow?.e2_version,
+    e2Id: exportRow?.e2_id || null,
+    e2Version: exportRow?.e2_version || null,
   };
 
   return { payload, meta };
@@ -349,9 +421,11 @@ async function buildE2Payload({ supabase, incident, exportRow, integration, envi
 
 module.exports = {
   buildE2Payload,
+  buildDeleteRequest,
   toAttributeCode,
   loadIncidentAttributesGeneric,
   loadIntegrationSettings,
   selectionToE2Value,
   generateEntityId,
+  getReportType,
 };
