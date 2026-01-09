@@ -113,10 +113,44 @@ async function buildSelections({ supabase, incident_id }) {
   if (!wide) return { source: "none", selections: [] };
 
   const selections = [];
-  if (wide.occurrence_class) selections.push({ code: "431", taxonomy_code: "24", format: "value_list_int_array", valueId: String(wide.occurrence_class) });
-  if (wide.phase_of_flight) selections.push({ code: "1072", taxonomy_code: "24", format: "value_list_int_array", valueId: String(wide.phase_of_flight) });
-  if (wide.aircraft_category) selections.push({ code: "17", taxonomy_code: "24", format: "value_list_int_array", valueId: String(wide.aircraft_category) });
-  if (wide.responsible_entity) selections.push({ code: "453", taxonomy_code: "24", format: "value_list_int_array", valueId: String(wide.responsible_entity) });
+  // Handle Occurrence Class (431)
+  const validOccurrenceClass = [100, 200, 300, 301, 302].includes(wide.occurrence_class) ? wide.occurrence_class : 100;
+  selections.push({
+    code: "431",
+    taxonomy_code: "24",
+    format: "value_list_int_array",
+    valueId: String(validOccurrenceClass)
+  });
+
+  // Handle Phase of Flight (1072)
+  if (wide.phase_of_flight) {
+    selections.push({
+      code: "1072",
+      taxonomy_code: "24",
+      format: "value_list_int_array",
+      valueId: String(wide.phase_of_flight),
+      content: "Flight Phase Content" // Add content here
+    });
+  }
+
+  // Handle Aircraft Category (17)
+  if (wide.aircraft_category) {
+    selections.push({
+      code: "17",
+      taxonomy_code: "24",
+      format: "value_list_int_array",
+      valueId: String(wide.aircraft_category)
+    });
+  }
+
+  // Handle Responsible Entity (453)
+  const validResponsibleEntity = [1, 2, 3, 4, 5, 6, 7].includes(wide.responsible_entity) ? wide.responsible_entity : 1;
+  selections.push({
+    code: "453",
+    taxonomy_code: "24",
+    format: "value_list_int_array",
+    valueId: String(validResponsibleEntity)
+  });
 
   return { source: "incident_eccairs_mappings", selections };
 }
@@ -141,14 +175,14 @@ function selectionToE2Value(sel) {
     if (sel.raw) return sel.raw; // you store the exact array-of-objects in payload_json
     const n = asInt(sel.valueId);
     if (n == null) return null;
-    return [{ value: n }]; // Make sure to send the value as an object for "object_array"
+    return [{ value: n }];
   }
 
   // value-list int array (classic)
   if (sel.format === "value_list_int_array") {
     const n = asInt(sel.valueId);
     if (n == null) return null;
-    return [{ value: n }];  // Ensure ValueList is an object array
+    return [{ value: n }];
   }
 
   // fallback: if unknown format and raw provided, use raw
@@ -161,7 +195,6 @@ function selectionToE2Value(sel) {
 
 // -------------------------
 // Main builder
-// mode: "create" or "edit" (for now: same structure)
 // -------------------------
 async function buildE2Payload({ supabase, incident, exportRow, integration, environment, mode }) {
   const taxBlock = {
@@ -177,10 +210,8 @@ async function buildE2Payload({ supabase, incident, exportRow, integration, envi
   const rejected = [];
   const attrs = {};
 
-  // only taxonomy 24 for now (you can expand later)
   const filtered = selections.filter((s) => (ensureString(s.taxonomy_code) || "24") === "24");
 
-  // validate value-lists only for formats that depend on value_list_items
   const valueListCandidates = filtered
     .filter((s) => s.format === "value_list_int_array")
     .filter((s) => s.valueId)
@@ -189,7 +220,6 @@ async function buildE2Payload({ supabase, incident, exportRow, integration, envi
   const validSet = await validateValueListSelections(supabase, valueListCandidates);
 
   for (const sel of filtered) {
-    // if value-list: ensure it exists in tax table
     if (sel.format === "value_list_int_array") {
       if (!sel.valueId) continue;
       const key = `VL${sel.code}:${sel.valueId}`;
