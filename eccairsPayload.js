@@ -51,7 +51,9 @@ async function validateValueListSelections(supabase, selections) {
 
     if (error) throw error;
 
-    for (const row of data || []) valid.add(`${row.value_list_key}:${row.value_id}`);
+    for (const row of data || []) {
+      valid.add(`${row.value_list_key}:${row.value_id}`);
+    }
   }
 
   return valid;
@@ -66,6 +68,7 @@ async function loadIncidentMappingsWide(supabase, incident_id) {
     .select("incident_id, occurrence_class, phase_of_flight, aircraft_category")
     .eq("incident_id", incident_id)
     .maybeSingle();
+
   if (error) throw error;
   return data || null;
 }
@@ -73,11 +76,27 @@ async function loadIncidentMappingsWide(supabase, incident_id) {
 async function loadIntegrationSettings(supabase, company_id) {
   const { data, error } = await supabase
     .from("eccairs_integrations")
-    .select("responsible_entity_id")
+    .select("responsible_entity_id, responsible_entity_value_id, reporting_entity_id")
     .eq("company_id", company_id)
     .maybeSingle();
+
   if (error) throw error;
   return data || null;
+}
+
+// NEW: Load incident_eccairs_attributes (den manglende funksjonen!)
+async function loadIncidentAttributesGeneric(supabase, incident_id) {
+  const { data, error } = await supabase
+    .from("incident_eccairs_attributes")
+    .select("attribute_code, value_id, taxonomy_code, format, payload_json, text_value")
+    .eq("incident_id", incident_id);
+
+  if (error) {
+    // Table might not exist
+    if (String(error.code) === "42P01") return null;
+    throw error;
+  }
+  return data || [];
 }
 
 // -------------------------
@@ -86,26 +105,47 @@ async function loadIntegrationSettings(supabase, company_id) {
 async function buildSelections({ supabase, incident_id, company_id }) {
   const generic = await loadIncidentAttributesGeneric(supabase, incident_id);
 
+  // Prioriter incident_eccairs_attributes hvis de finnes
   if (generic && generic.length > 0) {
-    // Existing code stays the same ...
+    const selections = []; // <-- FIKSET: Manglende array definisjon
+
+    for (const r of generic) {
+      const code = toAttributeCode(r.attribute_code);
+      if (!code) continue;
+
+      selections.push({
+        code,
+        taxonomy_code: ensureString(r.taxonomy_code) || "24",
+        format: ensureString(r.format) || "value_list_int_array",
+        valueId: ensureString(r.value_id),
+        text: ensureString(r.text_value),
+        raw: r.payload_json || null,
+      });
+    }
+
     return { source: "incident_eccairs_attributes", selections };
   }
 
+  // Fallback til incident_eccairs_mappings (legacy)
   const wide = await loadIncidentMappingsWide(supabase, incident_id);
   if (!wide) return { source: "none", selections: [] };
 
-  // Get responsible_entity from eccairs_integrations
+  // Hent responsible_entity fra eccairs_integrations
   const integration = await loadIntegrationSettings(supabase, company_id);
 
   const selections = [];
 
-  // Handle Occurrence Class (431)
-  const validOccurrenceClass = [100, 200, 300, 301, 302].includes(wide.occurrence_class) ? wide.occurrence_class : 100;
+  // Handle Occurrence Class (431) - påkrevd
+  const validOccurrenceClasses = [100, 200, 300, 301, 302];
+  const occurrenceClass = validOccurrenceClasses.includes(wide.occurrence_class) 
+    ? wide.occurrence_class 
+    : 100; // Default: Occurrence
+    
   selections.push({
     code: "431",
     taxonomy_code: "24",
     format: "value_list_int_array",
-    valueId: String(validOccurrenceClass)
+    valueId: String(occurrenceClass)
   });
 
   // Handle Phase of Flight (1072)
@@ -114,12 +154,11 @@ async function buildSelections({ supabase, incident_id, company_id }) {
       code: "1072",
       taxonomy_code: "24",
       format: "value_list_int_array",
-      valueId: String(wide.phase_of_flight),
-      content: "Flight Phase Content"  // Ensure content is added
+      valueId: String(wide.phase_of_flight)
     });
   }
 
-  // Handle Aircraft Category (17) - Verify if it needs to be a nested entity
+  // Handle Aircraft Category (17)
   if (wide.aircraft_category) {
     selections.push({
       code: "17",
@@ -129,8 +168,9 @@ async function buildSelections({ supabase, incident_id, company_id }) {
     });
   }
 
-  // Handle Responsible Entity (453) - from integration settings
-  const responsibleEntity = integration?.responsible_entity_id || 133; // Default Norway
+  // Handle Responsible Entity (453) - fra integration settings
+  // Bruk responsible_entity_id (integer) eller fall tilbake til 133 (Norway)
+  const responsibleEntity = integration?.responsible_entity_id || 133;
   selections.push({
     code: "453",
     taxonomy_code: "24",
@@ -145,44 +185,45 @@ async function buildSelections({ supabase, incident_id, company_id }) {
 // Convert selection -> E2 attribute payload value
 // -------------------------
 function selectionToE2Value(sel) {
-  // raw JSON override
+  // Raw JSON override - bruk direkte
   if (sel.format === "raw_json") {
     return sel.raw;
   }
 
-  // common E2 "content" pattern
+  // Text content array (f.eks. narrativer)
   if (sel.format === "text_content_array") {
     if (!sel.text) return null;
     return [{ content: sel.text }];
   }
 
-  // object array (for cases like your 1072 schema complaining "object expected")
+  // Object array (for komplekse strukturer)
   if (sel.format === "object_array") {
-    if (sel.raw) return sel.raw; // you store the exact array-of-objects in payload_json
+    if (sel.raw) return sel.raw;
     const n = asInt(sel.valueId);
     if (n == null) return null;
     return [{ value: n }];
   }
 
-  // value-list int array (classic)
+  // Value-list int array (standard format for de fleste attributter)
   if (sel.format === "value_list_int_array") {
     const n = asInt(sel.valueId);
     if (n == null) return null;
     return [{ value: n }];
   }
 
-  // Handle date_array format
-  if (sel.format === "date_array") {
+  // Date format (YYYY-MM-DD)
+  if (sel.format === "date_array" || sel.format === "local_date") {
     if (!sel.text) return null;
-    return [{ value: sel.text }]; // ISO-8601 date string
+    // E2 forventer ISO-8601 dato
+    return [{ value: sel.text }];
   }
 
-  // fallback: if unknown format and raw provided, use raw
+  // Fallback: hvis ukjent format og raw finnes, bruk raw
   if (sel.raw) return sel.raw;
 
-  // last resort: try int-array
+  // Last resort: prøv int-array med riktig format
   const n = asInt(sel.valueId);
-  return n == null ? null : [{ value: n }];
+  return n == null ? null : [{ value: n }]; // FIKSET: Var [n], nå [{ value: n }]
 }
 
 // -------------------------
@@ -206,8 +247,12 @@ async function buildE2Payload({ supabase, incident, exportRow, integration, envi
   const rejected = [];
   const attrs = {};
 
-  const filtered = selections.filter((s) => (ensureString(s.taxonomy_code) || "24") === "24");
+  // Filtrer til taxonomy 24
+  const filtered = selections.filter((s) => 
+    (ensureString(s.taxonomy_code) || "24") === "24"
+  );
 
+  // Valider value-list seleksjoner mot eccairs.value_list_items
   const valueListCandidates = filtered
     .filter((s) => s.format === "value_list_int_array")
     .filter((s) => s.valueId)
@@ -216,18 +261,28 @@ async function buildE2Payload({ supabase, incident, exportRow, integration, envi
   const validSet = await validateValueListSelections(supabase, valueListCandidates);
 
   for (const sel of filtered) {
+    // Valider value-list attributter
     if (sel.format === "value_list_int_array") {
       if (!sel.valueId) continue;
       const key = `VL${sel.code}:${sel.valueId}`;
       if (!validSet.has(key)) {
-        rejected.push({ attribute_code: sel.code, taxonomy_code: "24", value_id: sel.valueId, reason: "Not found in eccairs.value_list_items" });
+        rejected.push({ 
+          attribute_code: sel.code, 
+          taxonomy_code: "24", 
+          value_id: sel.valueId, 
+          reason: "Not found in eccairs.value_list_items" 
+        });
         continue;
       }
     }
 
     const v = selectionToE2Value(sel);
     if (v == null) {
-      rejected.push({ attribute_code: sel.code, taxonomy_code: "24", reason: `No value produced for format=${sel.format}` });
+      rejected.push({ 
+        attribute_code: sel.code, 
+        taxonomy_code: "24", 
+        reason: `No value produced for format=${sel.format}` 
+      });
       continue;
     }
 
@@ -238,7 +293,7 @@ async function buildE2Payload({ supabase, incident, exportRow, integration, envi
 
   const payload = {
     type: "REPORT",
-    status: "DRAFT",  // Ensure status is correct for "create" or "edit" operation
+    status: "DRAFT",
     taxonomy_codes: taxBlock,
     taxonomyCodes: taxBlock,
   };
@@ -254,8 +309,8 @@ async function buildE2Payload({ supabase, incident, exportRow, integration, envi
     attributes: attrs,
     export_id: exportRow?.id || null,
     company_id: integration?.company_id || null,
-    e2Id: exportRow?.e2_id,   // Ensure e2Id is included for update
-    e2Version: exportRow?.e2_version,  // Ensure e2Version is included for update
+    e2Id: exportRow?.e2_id,
+    e2Version: exportRow?.e2_version,
   };
 
   return { payload, meta };
@@ -264,4 +319,8 @@ async function buildE2Payload({ supabase, incident, exportRow, integration, envi
 module.exports = {
   buildE2Payload,
   toAttributeCode,
+  // Eksporter også hjelpefunksjoner for testing
+  loadIncidentAttributesGeneric,
+  loadIntegrationSettings,
+  selectionToE2Value,
 };
