@@ -1,5 +1,6 @@
 // ECCAIRS2 E2 API Payload Builder
-// Fikset for korrekt JSON-struktur per API Guide v4.26
+// Oppdatert for korrekt JSON-struktur per API Guide v4.26
+// Synkronisert med Lovable frontend config
 
 function toAttributeCode(codeOrVlKey) {
   if (codeOrVlKey == null) return null;
@@ -25,18 +26,11 @@ function asInt(v) {
   return n;
 }
 
-// Generer unik entity-ID
+// Generer unik entity-ID (34 tegn)
 function generateEntityId(suffix = "1") {
   const id = "ID" + String(suffix).padStart(32, "0");
   return id.slice(0, 34);
 }
-
-// Attributter som tilhører nested entities (ikke top-level)
-const ENTITY_ATTRIBUTE_MAP = {
-  "1": ["17", "18", "19", "20", "21"],     // Aircraft entity
-  "4": ["90", "91", "92"],                  // Aerodrome entity
-  "14": ["390"],                            // Event entity
-};
 
 // -------------------------
 // Value-list validation
@@ -98,7 +92,7 @@ async function loadIntegrationSettings(supabase, company_id) {
 async function loadIncidentAttributesGeneric(supabase, incident_id) {
   const { data, error } = await supabase
     .from("incident_eccairs_attributes")
-    .select("attribute_code, value_id, taxonomy_code, format, payload_json, text_value")
+    .select("attribute_code, value_id, taxonomy_code, format, payload_json, text_value, entity_path")
     .eq("incident_id", incident_id);
 
   if (error) {
@@ -108,19 +102,8 @@ async function loadIncidentAttributesGeneric(supabase, incident_id) {
   return data || [];
 }
 
-async function getValueDescription(supabase, vlKey, valueId) {
-  const { data } = await supabase
-    .schema("eccairs")
-    .from("value_list_items")
-    .select("value_description")
-    .eq("value_list_key", vlKey)
-    .eq("value_id", String(valueId))
-    .maybeSingle();
-  return data?.value_description || null;
-}
-
 // -------------------------
-// Build selections
+// Build selections fra incident_eccairs_attributes
 // -------------------------
 async function buildSelections({ supabase, incident_id, company_id }) {
   const generic = await loadIncidentAttributesGeneric(supabase, incident_id);
@@ -137,11 +120,13 @@ async function buildSelections({ supabase, incident_id, company_id }) {
         valueId: ensureString(r.value_id),
         text: ensureString(r.text_value),
         raw: r.payload_json || null,
+        entity_path: r.entity_path || null,  // NYTT: Les entity_path fra database
       });
     }
     return { source: "incident_eccairs_attributes", selections };
   }
 
+  // Fallback til legacy incident_eccairs_mappings
   const wide = await loadIncidentMappingsWide(supabase, incident_id);
   if (!wide) return { source: "none", selections: [] };
 
@@ -156,6 +141,7 @@ async function buildSelections({ supabase, incident_id, company_id }) {
   selections.push({
     code: "431",
     taxonomy_code: "24",
+    entity_path: null,
     format: "value_list_int_array",
     valueId: String(occurrenceClass)
   });
@@ -165,30 +151,30 @@ async function buildSelections({ supabase, incident_id, company_id }) {
   selections.push({
     code: "453",
     taxonomy_code: "24",
+    entity_path: null,
     format: "value_list_int_array",
     valueId: String(responsibleEntity)
   });
 
-  // 1072 - Phase of Flight (krever content-array format)
+  // 1072 - Detection Phase (FIKSET: content_object_array med integer)
   if (wide.phase_of_flight) {
-    const description = await getValueDescription(supabase, 'VL1072', wide.phase_of_flight);
     selections.push({
       code: "1072",
       taxonomy_code: "24",
-      format: "content_array",  // Nytt format for content: [...]
-      valueId: String(wide.phase_of_flight),
-      text: description || "Unknown"
+      entity_path: null,
+      format: "content_object_array",  // FIKSET: Riktig format-navn
+      valueId: String(wide.phase_of_flight)  // Integer ID, ikke tekst!
     });
   }
 
-  // 17 - Aircraft Category (ENTITY 1, ikke top-level!)
+  // 32 - Aircraft Category (FIKSET: Entity 4, ikke Entity 1!)
   if (wide.aircraft_category) {
     selections.push({
-      code: "17",
+      code: "32",  // FIKSET: Var 17, nå 32
       taxonomy_code: "24",
+      entity_path: "4",  // FIKSET: Aircraft entity (var "1")
       format: "value_list_int_array",
-      valueId: String(wide.aircraft_category),
-      entityCode: "1"  // Marker at dette tilhører Entity 1 (Aircraft)
+      valueId: String(wide.aircraft_category)
     });
   }
 
@@ -199,37 +185,48 @@ async function buildSelections({ supabase, incident_id, company_id }) {
 // Convert selection to E2 value
 // -------------------------
 function selectionToE2Value(sel) {
+  // 1. Raw JSON (for manuell overstyring)
   if (sel.format === "raw_json") {
     return sel.raw;
   }
 
-  // Content array - content må være en array
-  if (sel.format === "content_array") {
-    if (sel.text) {
-      return [{ content: [sel.text] }];  // FIKSET: content er array
-    }
+  // 2. Content object array - FIKSET: content må være integer array
+  // Brukes for: 1072 (Detection Phase), 454, etc.
+  if (sel.format === "content_object_array") {
     const n = asInt(sel.valueId);
     if (n == null) return null;
-    return [{ content: [n] }];  // FIKSET: content er array
+    return [{ content: [n] }];  // RIKTIG: [{"content": [10]}], ikke [{"content": ["Approach"]}]
   }
 
-  // Text content array (for narrativer)
+  // 3. Text content array (for narrativer, 1087 etc.)
   if (sel.format === "text_content_array") {
     if (!sel.text) return null;
     return [{ text: sel.text }];
   }
 
-  // Value-list integer array (standard)
+  // 4. Value-list integer array (standard for 431, 453, 32, 390, 391 etc.)
   if (sel.format === "value_list_int_array") {
     const n = asInt(sel.valueId);
     if (n == null) return null;
-    return [n];  // Bare integer i array
+    return [n];  // RIKTIG: [200], ikke [{"value": 200}]
   }
 
-  // Date format
-  if (sel.format === "date_array" || sel.format === "local_date") {
+  // 5. Local date (433)
+  if (sel.format === "local_date" || sel.format === "date_array") {
     if (!sel.text) return null;
-    return [sel.text];
+    return [sel.text];  // ["2024-01-15"]
+  }
+
+  // 6. String array (440 Location Name, etc.)
+  if (sel.format === "string_array") {
+    if (!sel.text) return null;
+    return [sel.text];  // ["Oslo"]
+  }
+
+  // 7. Time array (457 Local Time)
+  if (sel.format === "time_array") {
+    if (!sel.text) return null;
+    return [sel.text];  // ["14:30:00"]
   }
 
   // Fallback
@@ -239,7 +236,7 @@ function selectionToE2Value(sel) {
 }
 
 // -------------------------
-// Main builder
+// Main payload builder
 // -------------------------
 async function buildE2Payload({ supabase, incident, exportRow, integration, environment, mode }) {
   const taxBlock = {
@@ -258,7 +255,7 @@ async function buildE2Payload({ supabase, incident, exportRow, integration, envi
 
   const rejected = [];
   const topLevelAttrs = {};
-  const entityAttrs = {};  // Gruppert per entity
+  const entityAttrs = {};  // Gruppert per entity_path
 
   const filtered = selections.filter((s) => 
     (ensureString(s.taxonomy_code) || "24") === "24"
@@ -273,6 +270,7 @@ async function buildE2Payload({ supabase, incident, exportRow, integration, envi
   const validSet = await validateValueListSelections(supabase, valueListCandidates);
 
   for (const sel of filtered) {
+    // Valider value-list verdier mot eccairs.value_list_items
     if (sel.format === "value_list_int_array") {
       if (!sel.valueId) continue;
       const key = `VL${sel.code}:${sel.valueId}`;
@@ -295,10 +293,10 @@ async function buildE2Payload({ supabase, incident, exportRow, integration, envi
       continue;
     }
 
-    // Sjekk om attributtet tilhører en entity
-    if (sel.entityCode) {
-      if (!entityAttrs[sel.entityCode]) entityAttrs[sel.entityCode] = {};
-      entityAttrs[sel.entityCode][sel.code] = v;
+    // FIKSET: Bruk entity_path fra database/selection
+    if (sel.entity_path) {
+      if (!entityAttrs[sel.entity_path]) entityAttrs[sel.entity_path] = {};
+      entityAttrs[sel.entity_path][sel.code] = v;
     } else {
       topLevelAttrs[sel.code] = v;
     }
@@ -308,13 +306,18 @@ async function buildE2Payload({ supabase, incident, exportRow, integration, envi
   taxBlock["24"].ATTRIBUTES = topLevelAttrs;
 
   // Bygg ENTITIES-struktur for nested attributter
-  for (const [entityCode, attrs] of Object.entries(entityAttrs)) {
+  for (const [entityPath, attrs] of Object.entries(entityAttrs)) {
     if (Object.keys(attrs).length > 0) {
-      taxBlock["24"].ENTITIES[entityCode] = [{
-        ID: generateEntityId(entityCode),
+      taxBlock["24"].ENTITIES[entityPath] = [{
+        ID: generateEntityId(entityPath),
         ATTRIBUTES: attrs
       }];
     }
+  }
+
+  // Fjern tom ENTITIES hvis ingen entity-attributter
+  if (Object.keys(taxBlock["24"].ENTITIES).length === 0) {
+    delete taxBlock["24"].ENTITIES;
   }
 
   const payload = {
@@ -329,7 +332,8 @@ async function buildE2Payload({ supabase, incident, exportRow, integration, envi
     source,
     environment: environment || null,
     incident_id: incident?.id || null,
-    usedCount: Object.keys(topLevelAttrs).length + Object.values(entityAttrs).reduce((sum, a) => sum + Object.keys(a).length, 0),
+    usedCount: Object.keys(topLevelAttrs).length + 
+      Object.values(entityAttrs).reduce((sum, a) => sum + Object.keys(a).length, 0),
     selectionsCount: selections.length,
     rejected,
     topLevelAttributes: topLevelAttrs,
