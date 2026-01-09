@@ -1,5 +1,6 @@
 // server.js
-// Avisafe ECCAIRS gateway (Fly.io) - clean rebuild
+// Avisafe ECCAIRS gateway (Fly.io) - with DELETE endpoint
+// Lokal kopi for referanse - deploy til Fly.io
 
 const express = require("express");
 const Joi = require("joi");
@@ -31,7 +32,7 @@ app.use((req, res, next) => {
   if (allowOrigin) {
     res.setHeader("Access-Control-Allow-Origin", allowOrigin);
     if (allowOrigin !== "*") res.setHeader("Vary", "Origin");
-    res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,OPTIONS");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key");
     res.setHeader("Access-Control-Max-Age", "86400");
   }
@@ -172,6 +173,12 @@ const baseSchema = Joi.object({
 
 const getUrlSchema = Joi.object({
   e2_id: Joi.string().required(),
+  environment: Joi.string().valid("sandbox", "prod").default("sandbox"),
+}).unknown(false);
+
+const deleteSchema = Joi.object({
+  e2_id: Joi.string().required(),
+  incident_id: Joi.string().uuid().optional(),
   environment: Joi.string().valid("sandbox", "prod").default("sandbox"),
 }).unknown(false);
 
@@ -418,6 +425,112 @@ app.post("/api/eccairs/drafts/update", async (req, res) => {
     return res.json({ ok: true, incident_id, environment, e2_id: exportRow.e2_id, e2_version: updatedExport.e2_version, export: updatedExport, meta, raw: editJson });
   } catch (err) {
     console.error("Feil i /api/eccairs/drafts/update:", err);
+    return res.status(500).json({ ok: false, error: String(err.message || err) });
+  }
+});
+
+// -------------------------
+// Delete draft
+// POST /api/eccairs/drafts/delete
+// -------------------------
+app.post("/api/eccairs/drafts/delete", async (req, res) => {
+  try {
+    if (!requireAdminSupabase(res)) return;
+
+    const { error, value } = deleteSchema.validate(req.body || {});
+    if (error) return res.status(400).json({ ok: false, error: error.details[0].message });
+
+    const { e2_id, incident_id, environment } = value;
+
+    // Hvis incident_id er gitt, sjekk RLS-tilgang
+    if (incident_id) {
+      const access = await assertIncidentAccess({ jwt: req.jwt, incident_id });
+      if (!access.ok) return res.status(access.status).json({ ok: false, error: access.error });
+    }
+
+    // Hent access token
+    const token = await getE2AccessToken();
+    const base = process.env.E2_BASE_URL;
+    if (!base) return res.status(500).json({ ok: false, error: "E2_BASE_URL mangler i secrets" });
+
+    // ECCAIRS E2 DELETE - URL format: /occurrences/{e2Id}
+    // e2_id inneholder allerede prefix (OR-, VR-, OC-)
+    const deleteUrl = `${base}/occurrences/${e2_id}`;
+    
+    console.log("E2 DELETE request:", deleteUrl);
+
+    const deleteResp = await fetch(deleteUrl, {
+      method: "DELETE",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/json",
+      },
+      // VIKTIG: Body må være tom per API-dokumentasjon
+    });
+
+    const { parsed: deleteJson } = await readE2Response(deleteResp);
+
+    console.log("E2 DELETE RESPONSE", { 
+      status: deleteResp.status, 
+      ok: deleteResp.ok, 
+      body: deleteJson 
+    });
+
+    if (!deleteResp.ok) {
+      const errMsg = deleteJson?.errorDetails || deleteJson?.message || deleteJson?.error || `E2 delete failed (${deleteResp.status})`;
+      
+      // Oppdater eccairs_exports hvis incident_id er gitt
+      if (incident_id) {
+        await supabaseAdmin
+          .from("eccairs_exports")
+          .update({
+            status: "delete_failed",
+            last_error: errMsg,
+            response: deleteJson,
+            last_attempt_at: new Date().toISOString(),
+          })
+          .eq("incident_id", incident_id)
+          .eq("environment", environment);
+      }
+
+      return res.status(deleteResp.status).json({ 
+        ok: false, 
+        error: "E2 delete failed", 
+        status: deleteResp.status, 
+        message: errMsg, 
+        details: deleteJson 
+      });
+    }
+
+    // returnCode 1 = success i ECCAIRS
+    if (deleteJson?.returnCode === 1 || deleteResp.ok) {
+      // Slett eccairs_exports rad hvis incident_id er gitt
+      if (incident_id) {
+        await supabaseAdmin
+          .from("eccairs_exports")
+          .delete()
+          .eq("incident_id", incident_id)
+          .eq("environment", environment);
+      }
+
+      return res.json({ 
+        ok: true, 
+        deleted: e2_id,
+        environment,
+        message: "Draft deleted successfully",
+        raw: deleteJson
+      });
+    }
+
+    // Ukjent respons
+    return res.status(400).json({ 
+      ok: false, 
+      error: deleteJson?.errorDetails || "Unknown error from E2",
+      details: deleteJson
+    });
+
+  } catch (err) {
+    console.error("Feil i /api/eccairs/drafts/delete:", err);
     return res.status(500).json({ ok: false, error: String(err.message || err) });
   }
 });
