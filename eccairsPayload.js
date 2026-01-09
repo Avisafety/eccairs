@@ -63,56 +63,42 @@ async function validateValueListSelections(supabase, selections) {
 async function loadIncidentMappingsWide(supabase, incident_id) {
   const { data, error } = await supabase
     .from("incident_eccairs_mappings")
-    .select("incident_id, occurrence_class, phase_of_flight, aircraft_category, responsible_entity")
+    .select("incident_id, occurrence_class, phase_of_flight, aircraft_category")
     .eq("incident_id", incident_id)
     .maybeSingle();
   if (error) throw error;
   return data || null;
 }
 
-async function loadIncidentAttributesGeneric(supabase, incident_id) {
+async function loadIntegrationSettings(supabase, company_id) {
   const { data, error } = await supabase
-    .from("incident_eccairs_attributes")
-    .select("attribute_code, value_id, taxonomy_code, format, payload_json, text_value")
-    .eq("incident_id", incident_id);
-
-  if (error) {
-    if (String(error.code) === "42P01") return null; // table missing
-    throw error;
-  }
-  return data || [];
+    .from("eccairs_integrations")
+    .select("responsible_entity_id")
+    .eq("company_id", company_id)
+    .maybeSingle();
+  if (error) throw error;
+  return data || null;
 }
 
 // -------------------------
 // Build "selections" list
 // -------------------------
-async function buildSelections({ supabase, incident_id }) {
+async function buildSelections({ supabase, incident_id, company_id }) {
   const generic = await loadIncidentAttributesGeneric(supabase, incident_id);
 
   if (generic && generic.length > 0) {
-    const selections = [];
-
-    for (const r of generic) {
-      const code = toAttributeCode(r.attribute_code);
-      if (!code) continue;
-
-      selections.push({
-        code,
-        taxonomy_code: ensureString(r.taxonomy_code) || "24",
-        format: ensureString(r.format) || "value_list_int_array", // default fallback
-        valueId: ensureString(r.value_id),
-        text: ensureString(r.text_value),
-        raw: r.payload_json || null,
-      });
-    }
-
+    // Existing code stays the same ...
     return { source: "incident_eccairs_attributes", selections };
   }
 
   const wide = await loadIncidentMappingsWide(supabase, incident_id);
   if (!wide) return { source: "none", selections: [] };
 
+  // Get responsible_entity from eccairs_integrations
+  const integration = await loadIntegrationSettings(supabase, company_id);
+
   const selections = [];
+
   // Handle Occurrence Class (431)
   const validOccurrenceClass = [100, 200, 300, 301, 302].includes(wide.occurrence_class) ? wide.occurrence_class : 100;
   selections.push({
@@ -129,7 +115,7 @@ async function buildSelections({ supabase, incident_id }) {
       taxonomy_code: "24",
       format: "value_list_int_array",
       valueId: String(wide.phase_of_flight),
-      content: "Flight Phase Content" // Add content here
+      content: "Flight Phase Content"  // Ensure content is added
     });
   }
 
@@ -143,13 +129,13 @@ async function buildSelections({ supabase, incident_id }) {
     });
   }
 
-  // Handle Responsible Entity (453)
-  const validResponsibleEntity = [1, 2, 3, 4, 5, 6, 7].includes(wide.responsible_entity) ? wide.responsible_entity : 1;
+  // Handle Responsible Entity (453) - from integration settings
+  const responsibleEntity = integration?.responsible_entity_id || 133; // Default Norway
   selections.push({
     code: "453",
     taxonomy_code: "24",
     format: "value_list_int_array",
-    valueId: String(validResponsibleEntity)
+    valueId: String(responsibleEntity)
   });
 
   return { source: "incident_eccairs_mappings", selections };
@@ -205,7 +191,11 @@ async function buildE2Payload({ supabase, incident, exportRow, integration, envi
     },
   };
 
-  const { selections, source } = await buildSelections({ supabase, incident_id: incident.id });
+  const { selections, source } = await buildSelections({ 
+    supabase, 
+    incident_id: incident.id,
+    company_id: integration?.company_id || incident.company_id 
+  });
 
   const rejected = [];
   const attrs = {};
@@ -242,8 +232,7 @@ async function buildE2Payload({ supabase, incident, exportRow, integration, envi
 
   const payload = {
     type: "REPORT",
-    status: "DRAFT",
-
+    status: "DRAFT",  // Ensure status is correct for "create" or "edit" operation
     taxonomy_codes: taxBlock,
     taxonomyCodes: taxBlock,
   };
@@ -259,6 +248,8 @@ async function buildE2Payload({ supabase, incident, exportRow, integration, envi
     attributes: attrs,
     export_id: exportRow?.id || null,
     company_id: integration?.company_id || null,
+    e2Id: exportRow?.e2_id,   // Ensure e2Id is included for update
+    e2Version: exportRow?.e2_version,  // Ensure e2Version is included for update
   };
 
   return { payload, meta };
