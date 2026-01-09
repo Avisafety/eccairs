@@ -453,11 +453,14 @@ app.post("/api/eccairs/drafts/delete", async (req, res) => {
     const base = process.env.E2_BASE_URL;
     if (!base) return res.status(500).json({ ok: false, error: "E2_BASE_URL mangler i secrets" });
 
-    // ECCAIRS E2 DELETE - URL format: /occurrences/{e2Id}
-    // e2_id inneholder allerede prefix (OR-, VR-, OC-)
-    const deleteUrl = `${base}/occurrences/${e2_id}`;
+    // ECCAIRS E2 DELETE - URL format: /occurrences/{type}/{numericId}
+    // e2_id format is "OR-0000000000073873", we need to extract type and numeric part
+    const type = e2_id.startsWith('VR-') ? 'VR' : e2_id.startsWith('OC-') ? 'OC' : 'OR';
+    const numericId = e2_id.replace(/^(OR|VR|OC)-/, '');
     
-    console.log("E2 DELETE request:", deleteUrl);
+    const deleteUrl = `${base}/occurrences/${type}/${numericId}`;
+    
+    console.log("E2 DELETE request:", deleteUrl, { e2_id, type, numericId });
 
     const deleteResp = await fetch(deleteUrl, {
       method: "DELETE",

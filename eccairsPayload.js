@@ -40,6 +40,13 @@ function getReportType(e2Id) {
   return 'OR';
 }
 
+// Extract numeric part from e2Id (e.g., "OR-0000000000073873" -> "0000000000073873")
+function getE2IdNumericPart(e2Id) {
+  if (!e2Id) return e2Id;
+  // Remove prefix (OR-, VR-, OC-)
+  return e2Id.replace(/^(OR|VR|OC)-/, '');
+}
+
 // -------------------------
 // Value-list validation
 // -------------------------
@@ -244,6 +251,8 @@ function selectionToE2Value(sel) {
 
 // -------------------------
 // Build DELETE request info
+// Per ECCAIRS API docs: DELETE {BASE_URL}/occurrences/OR/{e2Id}
+// where e2Id is the numeric part only (without prefix)
 // -------------------------
 function buildDeleteRequest({ e2Id, environment }) {
   if (!e2Id) {
@@ -255,16 +264,18 @@ function buildDeleteRequest({ e2Id, environment }) {
     : 'https://api.intg-aviationreporting.eu';
 
   const type = getReportType(e2Id);
+  const numericId = getE2IdNumericPart(e2Id);
 
   return {
     method: 'DELETE',
-    url: `${baseUrl}/occurrences/${type}/${e2Id}`,
+    url: `${baseUrl}/occurrences/${type}/${numericId}`,
     headers: {
       'Accept': 'application/json'
     },
     body: null, // DELETE må ha tom body per API-dokumentasjon
     meta: {
       e2Id,
+      numericId,
       type,
       environment,
       operation: 'delete'
