@@ -453,14 +453,16 @@ app.post("/api/eccairs/drafts/delete", async (req, res) => {
     const base = process.env.E2_BASE_URL;
     if (!base) return res.status(500).json({ ok: false, error: "E2_BASE_URL mangler i secrets" });
 
-    // ECCAIRS E2 DELETE - URL format: /occurrences/{type}/{numericId}
-    // e2_id format is "OR-0000000000073873", we need to extract type and numeric part
-    const type = e2_id.startsWith('VR-') ? 'VR' : e2_id.startsWith('OC-') ? 'OC' : 'OR';
-    const numericId = e2_id.replace(/^(OR|VR|OC)-/, '');
-    
-    const deleteUrl = `${base}/occurrences/${type}/${numericId}`;
-    
-    console.log("E2 DELETE request:", deleteUrl, { e2_id, type, numericId });
+    // ECCAIRS E2 DELETE (API Guide v4.26)
+    // URL format:
+    //   DELETE {BASE_URL}/occurrences/OR/{e2Id}
+    // where e2Id is the full identifier, e.g. "OR-0000000000000010"
+    const type = e2_id.startsWith("VR-") ? "VR" : e2_id.startsWith("OC-") ? "OC" : "OR";
+    const encodedE2Id = encodeURIComponent(String(e2_id));
+
+    const deleteUrl = `${base}/occurrences/${type}/${encodedE2Id}`;
+
+    console.log("E2 DELETE request:", deleteUrl, { e2_id, type });
 
     const deleteResp = await fetch(deleteUrl, {
       method: "DELETE",

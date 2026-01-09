@@ -251,8 +251,10 @@ function selectionToE2Value(sel) {
 
 // -------------------------
 // Build DELETE request info
-// Per ECCAIRS API docs: DELETE {BASE_URL}/occurrences/OR/{e2Id}
-// where e2Id is the numeric part only (without prefix)
+// API Guide v4.26:
+//  - DELETE {BASE_URL}/occurrences/OR/{e2Id}
+//  - Body must be empty
+//  - e2Id is the full identifier, e.g. "OR-0000000000000010"
 // -------------------------
 function buildDeleteRequest({ e2Id, environment }) {
   if (!e2Id) {
@@ -264,18 +266,17 @@ function buildDeleteRequest({ e2Id, environment }) {
     : 'https://api.intg-aviationreporting.eu';
 
   const type = getReportType(e2Id);
-  const numericId = getE2IdNumericPart(e2Id);
+  const encodedE2Id = encodeURIComponent(String(e2Id));
 
   return {
     method: 'DELETE',
-    url: `${baseUrl}/occurrences/${type}/${numericId}`,
+    url: `${baseUrl}/occurrences/${type}/${encodedE2Id}`,
     headers: {
       'Accept': 'application/json'
     },
     body: null, // DELETE må ha tom body per API-dokumentasjon
     meta: {
       e2Id,
-      numericId,
       type,
       environment,
       operation: 'delete'
