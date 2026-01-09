@@ -1,4 +1,3 @@
-// eccairsPayload.js
 // Schema-aware payload builder for E2 (ECCAIRS2 / E2)
 
 function toAttributeCode(codeOrVlKey) {
@@ -124,7 +123,6 @@ async function buildSelections({ supabase, incident_id }) {
 
 // -------------------------
 // Convert selection -> E2 attribute payload value
-// IMPORTANT: format comes from DB per attribute.
 // -------------------------
 function selectionToE2Value(sel) {
   // raw JSON override
@@ -139,21 +137,18 @@ function selectionToE2Value(sel) {
   }
 
   // object array (for cases like your 1072 schema complaining "object expected")
-  // Example DB payload_json:
-  //   [{"id": 10}] or [{"value": 10}] depending on E2 schema you use.
   if (sel.format === "object_array") {
     if (sel.raw) return sel.raw; // you store the exact array-of-objects in payload_json
     const n = asInt(sel.valueId);
     if (n == null) return null;
-    // safe default object
-    return [{ id: n }];
+    return [{ value: n }]; // Make sure to send the value as an object for "object_array"
   }
 
   // value-list int array (classic)
   if (sel.format === "value_list_int_array") {
     const n = asInt(sel.valueId);
     if (n == null) return null;
-    return [n];
+    return [{ value: n }];  // Ensure ValueList is an object array
   }
 
   // fallback: if unknown format and raw provided, use raw
@@ -169,8 +164,6 @@ function selectionToE2Value(sel) {
 // mode: "create" or "edit" (for now: same structure)
 // -------------------------
 async function buildE2Payload({ supabase, incident, exportRow, integration, environment, mode }) {
-  // E2 seems to validate on "taxonomy_codes" (snake_case) in your logs.
-  // To be robust, we send both keys for now. When confirmed, keep only one.
   const taxBlock = {
     "24": {
       ID: "ID00000000000000000000000000000001",
@@ -221,7 +214,6 @@ async function buildE2Payload({ supabase, incident, exportRow, integration, envi
     type: "REPORT",
     status: "DRAFT",
 
-    // dual key casing for compatibility (remove one when verified)
     taxonomy_codes: taxBlock,
     taxonomyCodes: taxBlock,
   };
