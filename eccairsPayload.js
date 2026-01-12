@@ -231,14 +231,19 @@ function selectionToE2Value(sel) {
     return [sel.text];
   }
 
-  // 6. String array (440 Location Name, etc.)
-  if (sel.format === "string_array") {
+  // 6. Local time (457) - format HH:MM eller HH:MM:SS
+  if (sel.format === "local_time" || sel.format === "time_array") {
     if (!sel.text) return null;
-    return [sel.text];
+    // Sørg for HH:MM:SS format hvis bare HH:MM
+    const timeValue = sel.text;
+    if (timeValue.match(/^\d{2}:\d{2}$/)) {
+      return [timeValue + ':00'];
+    }
+    return [timeValue];
   }
 
-  // 7. Time array (457 Local Time)
-  if (sel.format === "time_array") {
+  // 7. String array (440 Location Name, 601 Headline, etc.)
+  if (sel.format === "string_array") {
     if (!sel.text) return null;
     return [sel.text];
   }
