@@ -712,6 +712,10 @@ app.post("/api/eccairs/attachments/:e2Id", upload.array("files", 10), async (req
 
     const uploadUrl = `${base}/occurrences/attachments/${encodeURIComponent(e2Id)}`;
 
+    // Convert FormData to Buffer for native fetch compatibility
+    const formBuffer = formData.getBuffer();
+    const formHeaders = formData.getHeaders();
+
     console.log("E2 ATTACHMENT UPLOAD:", {
       url: uploadUrl,
       fileCount: files.length,
@@ -719,6 +723,7 @@ app.post("/api/eccairs/attachments/:e2Id", upload.array("files", 10), async (req
       attributePath,
       versionType,
       entityID,
+      contentType: formHeaders['content-type'],
     });
 
     const uploadResp = await fetch(uploadUrl, {
@@ -726,9 +731,10 @@ app.post("/api/eccairs/attachments/:e2Id", upload.array("files", 10), async (req
       headers: {
         Authorization: `Bearer ${token}`,
         Accept: "application/json",
-        ...formData.getHeaders(),
+        "User-Agent": "Avisafe-ECCAIRS-Gateway/1.0",
+        ...formHeaders,
       },
-      body: formData,
+      body: formBuffer,
     });
 
     const { parsed: uploadJson } = await readE2Response(uploadResp);
