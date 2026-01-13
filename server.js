@@ -677,7 +677,7 @@ app.post("/api/eccairs/attachments/:e2Id", upload.array("files", 10), async (req
 
     // Get optional parameters from body
     const attributePath = req.body.attributePath || "24.ATTRIBUTES.793"; // Default: occurrence level
-    const versionType = req.body.versionType || "MINOR";
+    const versionType = req.body.versionType || "DRAFT";
     const entityID = req.body.entityID || null;
 
     // Validate versionType
