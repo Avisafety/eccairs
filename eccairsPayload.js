@@ -257,7 +257,7 @@ function selectionToE2Value(sel) {
 // -------------------------
 // Build DELETE request info
 // API Guide v4.26:
-//  - DELETE {BASE_URL}/occurrences/OR/{e2Id}
+//  - DELETE {BASE_URL}/occurrences/delete-draft/OR/{e2Id}
 //  - Body must be empty
 //  - e2Id is the full identifier, e.g. "OR-0000000000000010"
 // -------------------------
@@ -275,7 +275,7 @@ function buildDeleteRequest({ e2Id, environment }) {
 
   return {
     method: 'DELETE',
-    url: `${baseUrl}/occurrences/${type}/${encodedE2Id}`,
+    url: `${baseUrl}/occurrences/delete-draft/${type}/${encodedE2Id}`,
     headers: {
       'Accept': 'application/json'
     },
