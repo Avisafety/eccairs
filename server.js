@@ -455,12 +455,12 @@ app.post("/api/eccairs/drafts/delete", async (req, res) => {
 
     // ECCAIRS E2 DELETE (API Guide v4.26)
     // URL format:
-    //   DELETE {BASE_URL}/occurrences/OR/{e2Id}
+    //   DELETE {BASE_URL}/occurrences/delete-draft/OR/{e2Id}
     // where e2Id is the full identifier, e.g. "OR-0000000000000010"
     const type = e2_id.startsWith("VR-") ? "VR" : e2_id.startsWith("OC-") ? "OC" : "OR";
     const encodedE2Id = encodeURIComponent(String(e2_id));
 
-    const deleteUrl = `${base}/occurrences/${type}/${encodedE2Id}`;
+    const deleteUrl = `${base}/occurrences/delete-draft/${type}/${encodedE2Id}`;
 
     console.log("E2 DELETE request:", deleteUrl, { e2_id, type });
 
