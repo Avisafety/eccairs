@@ -118,6 +118,19 @@ async function loadIncidentAttributesGeneric(supabase, incident_id) {
 }
 
 // -------------------------
+// Entity path overrides - attributter som alltid må ligge under en spesifikk entitet
+// -------------------------
+const ENTITY_PATH_OVERRIDES = {
+  '390': '14',  // Event_Type -> Events entity (Entity 14)
+  '32': '4',    // Aircraft Category -> Aircraft entity (Entity 4)
+};
+
+// -------------------------
+// Attributes that must ALWAYS be at top-level (Entity 24) regardless of DB value
+// -------------------------
+const FORCE_TOP_LEVEL = new Set(['432', '448']);
+
+// -------------------------
 // Build selections fra incident_eccairs_attributes
 // -------------------------
 async function buildSelections({ supabase, incident_id, company_id }) {
@@ -128,6 +141,15 @@ async function buildSelections({ supabase, incident_id, company_id }) {
     for (const r of generic) {
       const code = toAttributeCode(r.attribute_code);
       if (!code) continue;
+      
+      // Force certain attributes to top-level, ignoring any stored entity_path
+      let entityPath;
+      if (FORCE_TOP_LEVEL.has(code)) {
+        entityPath = null;
+      } else {
+        entityPath = r.entity_path || ENTITY_PATH_OVERRIDES[code] || null;
+      }
+      
       selections.push({
         code,
         taxonomy_code: ensureString(r.taxonomy_code) || "24",
@@ -135,7 +157,7 @@ async function buildSelections({ supabase, incident_id, company_id }) {
         valueId: ensureString(r.value_id),
         text: ensureString(r.text_value),
         raw: r.payload_json || null,
-        entity_path: r.entity_path || null,
+        entity_path: entityPath,
       });
     }
     return { source: "incident_eccairs_attributes", selections };
@@ -231,7 +253,13 @@ function selectionToE2Value(sel) {
     return [sel.text];
   }
 
-  // 6. Local time (457) - format HH:MM eller HH:MM:SS
+  // 6. UTC date (477) - same format as local_date
+  if (sel.format === "utc_date") {
+    if (!sel.text) return null;
+    return [sel.text];
+  }
+
+  // 7. Local time (457) - format HH:MM eller HH:MM:SS
   if (sel.format === "local_time" || sel.format === "time_array") {
     if (!sel.text) return null;
     // Sørg for HH:MM:SS format hvis bare HH:MM
@@ -242,7 +270,7 @@ function selectionToE2Value(sel) {
     return [timeValue];
   }
 
-  // 7. String array (440 Location Name, 601 Headline, etc.)
+  // 8. String array (440 Location Name, 601 Headline, etc.)
   if (sel.format === "string_array") {
     if (!sel.text) return null;
     return [sel.text];
