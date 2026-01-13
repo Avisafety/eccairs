@@ -1,12 +1,23 @@
 // server.js
-// Avisafe ECCAIRS gateway (Fly.io) - with DELETE endpoint
+// Avisafe ECCAIRS gateway (Fly.io) - with DELETE and ATTACHMENTS endpoints
 // Lokal kopi for referanse - deploy til Fly.io
 
 const express = require("express");
 const Joi = require("joi");
+const multer = require("multer");
+const FormData = require("form-data");
 const { createClient } = require("@supabase/supabase-js");
 const { buildE2Payload } = require("./eccairsPayload");
 const { getE2AccessToken } = require("./e2Client");
+
+// Multer configuration for file uploads (in memory)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 50 * 1024 * 1024, // 50MB max per file
+    files: 10, // max 10 files at once
+  },
+});
 
 const app = express();
 
@@ -641,6 +652,115 @@ app.post("/api/eccairs/submit", async (req, res) => {
     return res.json({ ok: true, incident_id, environment, e2_id: exp.e2_id, export: updated, raw: j });
   } catch (err) {
     console.error("Feil i /api/eccairs/submit:", err);
+    return res.status(500).json({ ok: false, error: String(err.message || err) });
+  }
+});
+
+// -------------------------
+// Upload Attachments
+// POST /api/eccairs/attachments/:e2Id
+// Multipart form-data with files
+// -------------------------
+app.post("/api/eccairs/attachments/:e2Id", upload.array("files", 10), async (req, res) => {
+  try {
+    if (!requireAdminSupabase(res)) return;
+
+    const { e2Id } = req.params;
+    if (!e2Id) {
+      return res.status(400).json({ ok: false, error: "e2Id er påkrevd" });
+    }
+
+    const files = req.files;
+    if (!files || files.length === 0) {
+      return res.status(400).json({ ok: false, error: "Ingen filer lastet opp" });
+    }
+
+    // Get optional parameters from body
+    const attributePath = req.body.attributePath || "24.ATTRIBUTES.793"; // Default: occurrence level
+    const versionType = req.body.versionType || "MINOR";
+    const entityID = req.body.entityID || null;
+
+    // Validate versionType
+    if (!["DRAFT", "MINOR", "MAJOR"].includes(versionType)) {
+      return res.status(400).json({ ok: false, error: "versionType må være DRAFT, MINOR eller MAJOR" });
+    }
+
+    // Get E2 access token
+    const token = await getE2AccessToken();
+    const base = process.env.E2_BASE_URL;
+    if (!base) {
+      return res.status(500).json({ ok: false, error: "E2_BASE_URL mangler i secrets" });
+    }
+
+    // Build multipart form data for E2 API
+    const formData = new FormData();
+    
+    // Add files
+    for (const file of files) {
+      formData.append("files", file.buffer, {
+        filename: file.originalname,
+        contentType: file.mimetype,
+      });
+    }
+
+    // Add required parameters
+    formData.append("attributePath", attributePath);
+    formData.append("versionType", versionType);
+    if (entityID) {
+      formData.append("entityID", entityID);
+    }
+
+    const uploadUrl = `${base}/occurrences/attachments/${encodeURIComponent(e2Id)}`;
+
+    console.log("E2 ATTACHMENT UPLOAD:", {
+      url: uploadUrl,
+      fileCount: files.length,
+      fileNames: files.map(f => f.originalname),
+      attributePath,
+      versionType,
+      entityID,
+    });
+
+    const uploadResp = await fetch(uploadUrl, {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/json",
+        ...formData.getHeaders(),
+      },
+      body: formData,
+    });
+
+    const { parsed: uploadJson } = await readE2Response(uploadResp);
+
+    console.log("E2 ATTACHMENT RESPONSE:", {
+      status: uploadResp.status,
+      ok: uploadResp.ok,
+      body: uploadJson,
+    });
+
+    if (!uploadResp.ok) {
+      const errMsg = uploadJson?.errorDetails || uploadJson?.message || uploadJson?.error || `E2 attachment upload failed (${uploadResp.status})`;
+      return res.status(uploadResp.status).json({
+        ok: false,
+        error: "E2 attachment upload failed",
+        status: uploadResp.status,
+        message: errMsg,
+        details: uploadJson,
+      });
+    }
+
+    return res.json({
+      ok: true,
+      e2Id,
+      fileCount: files.length,
+      fileNames: files.map(f => f.originalname),
+      attributePath,
+      versionType,
+      raw: uploadJson,
+    });
+  } catch (err) {
+    console.error("Feil i /api/eccairs/attachments:", err);
     return res.status(500).json({ ok: false, error: String(err.message || err) });
   }
 });
