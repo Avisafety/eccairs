@@ -1,26 +1,29 @@
 // e2Client.js
+// ECCAIRS E2 OAuth2 Client - Multi-tenant support
+// Lokalt referanse - deploy til Fly.io
 
-const E2_BASE_URL = process.env.E2_BASE_URL;
-const E2_CLIENT_ID = process.env.E2_CLIENT_ID;
-const E2_CLIENT_SECRET = process.env.E2_CLIENT_SECRET;
-const E2_SCOPE = process.env.E2_SCOPE || "openid";
+// Fallback til globale env-variabler (brukes hvis ingen per-selskap credentials)
+const GLOBAL_E2_BASE_URL = process.env.E2_BASE_URL;
+const GLOBAL_E2_CLIENT_ID = process.env.E2_CLIENT_ID;
+const GLOBAL_E2_CLIENT_SECRET = process.env.E2_CLIENT_SECRET;
+const GLOBAL_E2_SCOPE = process.env.E2_SCOPE || "openid";
 
-if (!E2_BASE_URL || !E2_CLIENT_ID || !E2_CLIENT_SECRET) {
-  console.warn("[E2] Missing env vars: E2_BASE_URL / E2_CLIENT_ID / E2_CLIENT_SECRET");
+if (!GLOBAL_E2_BASE_URL || !GLOBAL_E2_CLIENT_ID || !GLOBAL_E2_CLIENT_SECRET) {
+  console.warn("[E2] Missing global env vars: E2_BASE_URL / E2_CLIENT_ID / E2_CLIENT_SECRET - will require per-company credentials");
 }
 
-let cachedToken = null;
+// Token cache per company (eller 'global' for fallback)
+const tokenCache = new Map();
 
 function basicAuthHeader(id, secret) {
   return "Basic " + Buffer.from(`${id}:${secret}`).toString("base64");
 }
 
-async function requestToken(tokenPath, mode) {
+async function requestToken({ baseUrl, clientId, clientSecret, scope }, tokenPath, mode) {
   const body = new URLSearchParams({
     grant_type: "client_credentials",
   });
-
-  if (E2_SCOPE) body.set("scope", E2_SCOPE);
+  if (scope) body.set("scope", scope);
 
   const headers = {
     Accept: "application/json",
@@ -28,13 +31,13 @@ async function requestToken(tokenPath, mode) {
   };
 
   if (mode === "body") {
-    body.set("client_id", E2_CLIENT_ID);
-    body.set("client_secret", E2_CLIENT_SECRET);
+    body.set("client_id", clientId);
+    body.set("client_secret", clientSecret);
   } else if (mode === "basic") {
-    headers.Authorization = basicAuthHeader(E2_CLIENT_ID, E2_CLIENT_SECRET);
+    headers.Authorization = basicAuthHeader(clientId, clientSecret);
   }
 
-  const url = `${E2_BASE_URL}${tokenPath}`;
+  const url = `${baseUrl}${tokenPath}`;
   console.log(`[E2] Token request: ${url} (mode: ${mode})`);
 
   const res = await fetch(url, { method: "POST", headers, body });
@@ -63,13 +66,34 @@ async function requestToken(tokenPath, mode) {
   return data;
 }
 
-async function getE2AccessToken() {
-  const now = Date.now();
-  if (cachedToken && now < cachedToken.expiresAt) return cachedToken.token;
+/**
+ * Get E2 access token - supports per-company credentials
+ * @param {Object} integration - Optional integration object with e2_client_id, e2_client_secret, e2_base_url, e2_scope
+ * @returns {Promise<string>} Access token
+ */
+async function getE2AccessToken(integration = null) {
+  // Determine which credentials to use
+  const clientId = integration?.e2_client_id || GLOBAL_E2_CLIENT_ID;
+  const clientSecret = integration?.e2_client_secret || GLOBAL_E2_CLIENT_SECRET;
+  const baseUrl = integration?.e2_base_url || GLOBAL_E2_BASE_URL;
+  const scope = integration?.e2_scope || GLOBAL_E2_SCOPE;
 
-  // Prioriter /idp/oauth2/token først (korrekt ifølge ECCAIRS API Guide v4.26)
+  if (!clientId || !clientSecret || !baseUrl) {
+    throw new Error("E2 credentials not configured (neither per-company nor global)");
+  }
+
+  // Use company_id as cache key, or 'global' for fallback
+  const cacheKey = integration?.company_id || "global";
+  const now = Date.now();
+  
+  const cached = tokenCache.get(cacheKey);
+  if (cached && now < cached.expiresAt) {
+    return cached.token;
+  }
+
+  // Token attempts with preferred order
   const attempts = [
-    { path: "/idp/oauth2/token", mode: "body" },   // Most likely correct
+    { path: "/idp/oauth2/token", mode: "body" },   // Most likely correct per ECCAIRS API Guide v4.26
     { path: "/idp/oauth2/token", mode: "basic" },
     { path: "/oauth2/token", mode: "body" },       // Fallback
     { path: "/oauth2/token", mode: "basic" },
@@ -80,15 +104,16 @@ async function getE2AccessToken() {
 
   for (const a of attempts) {
     try {
-      const data = await requestToken(a.path, a.mode);
-      console.log(`[E2] Token obtained successfully via ${a.path} (${a.mode})`);
-
+      const data = await requestToken({ baseUrl, clientId, clientSecret, scope }, a.path, a.mode);
+      console.log(`[E2] Token obtained successfully via ${a.path} (${a.mode}) for ${cacheKey}`);
+      
       const skewMs = 60_000;
-      cachedToken = {
+      tokenCache.set(cacheKey, {
         token: data.access_token,
         expiresAt: Date.now() + (data.expires_in * 1000) - skewMs,
-      };
-      return cachedToken.token;
+      });
+      
+      return data.access_token;
     } catch (err) {
       console.warn(`[E2] Attempt ${a.path} (${a.mode}) failed: ${err.message}`);
       errors.push(`${a.path} (${a.mode}): ${err.message}`);
@@ -100,11 +125,27 @@ async function getE2AccessToken() {
   throw lastErr || new Error("E2 token request failed - all attempts exhausted");
 }
 
-async function e2Fetch(path, init = {}) {
-  const token = await getE2AccessToken();
+/**
+ * Clear cached token for a company (call after credential update)
+ * @param {string} companyId 
+ */
+function clearTokenCache(companyId = "global") {
+  tokenCache.delete(companyId);
+  console.log(`[E2] Token cache cleared for ${companyId}`);
+}
 
+/**
+ * Make authenticated E2 API call with auto-refresh
+ * @param {string} path - API path
+ * @param {Object} init - fetch options
+ * @param {Object} integration - Optional integration object
+ */
+async function e2Fetch(path, init = {}, integration = null) {
+  const baseUrl = integration?.e2_base_url || GLOBAL_E2_BASE_URL;
+  const token = await getE2AccessToken(integration);
+  
   const doFetch = async (tok) =>
-    fetch(`${E2_BASE_URL}${path}`, {
+    fetch(`${baseUrl}${path}`, {
       ...init,
       headers: {
         Accept: "application/json",
@@ -114,15 +155,16 @@ async function e2Fetch(path, init = {}) {
     });
 
   let res = await doFetch(token);
-
+  
   if (res.status === 401) {
     console.log("[E2] Got 401, refreshing token...");
-    cachedToken = null;
-    const token2 = await getE2AccessToken();
+    const cacheKey = integration?.company_id || "global";
+    tokenCache.delete(cacheKey);
+    const token2 = await getE2AccessToken(integration);
     res = await doFetch(token2);
   }
-
+  
   return res;
 }
 
-module.exports = { getE2AccessToken, e2Fetch };
+module.exports = { getE2AccessToken, e2Fetch, clearTokenCache };

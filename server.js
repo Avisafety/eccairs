@@ -1,6 +1,6 @@
 // server.js
 // Avisafe ECCAIRS gateway (Fly.io) - with DELETE and ATTACHMENTS endpoints
-// Lokal kopi for referanse - deploy til Fly.io
+// Lokalt referanse - deploy til Fly.io
 
 const express = require("express");
 const Joi = require("joi");
@@ -8,7 +8,7 @@ const multer = require("multer");
 const FormData = require("form-data");
 const { createClient } = require("@supabase/supabase-js");
 const { buildE2Payload } = require("./eccairsPayload");
-const { getE2AccessToken } = require("./e2Client");
+const { getE2AccessToken, clearTokenCache } = require("./e2Client");
 
 // Multer configuration for file uploads (in memory)
 const upload = multer({
@@ -125,7 +125,14 @@ async function assertIncidentAccess({ jwt, incident_id }) {
   return { ok: true, incident: data };
 }
 
-// Load active integration for company+env
+// Get default base URL based on environment
+function getDefaultBaseUrl(environment) {
+  return environment === 'prod'
+    ? 'https://api.aviationreporting.eu'
+    : 'https://api.intg-aviationreporting.eu';
+}
+
+// Load active integration for company+env with per-company credentials support
 async function loadIntegration({ company_id, environment }) {
   const { data, error } = await supabaseAdmin
     .from("eccairs_integrations")
@@ -137,7 +144,46 @@ async function loadIntegration({ company_id, environment }) {
 
   if (error) return { ok: false, status: 500, error: "Feil ved henting av eccairs_integrations", details: error };
   if (!data) return { ok: false, status: 400, error: "ECCAIRS integrasjon er ikke konfigurert for dette selskapet/miljøet" };
-  return { ok: true, integration: data };
+
+  // Try to get per-company credentials from Supabase RPC (decrypted)
+  const { data: creds, error: credErr } = await supabaseAdmin
+    .rpc("get_eccairs_credentials", {
+      p_company_id: company_id,
+      p_environment: environment,
+    });
+
+  if (credErr) {
+    console.warn("[loadIntegration] Could not fetch credentials via RPC:", credErr.message);
+  }
+
+  // Build integration object with credentials
+  let integration = { ...data, company_id };
+  
+  if (creds && creds.length > 0) {
+    const c = creds[0];
+    integration = {
+      ...integration,
+      e2_client_id: c.e2_client_id,
+      e2_client_secret: c.e2_client_secret,
+      e2_base_url: c.e2_base_url || getDefaultBaseUrl(environment),
+      e2_scope: c.e2_scope || 'openid',
+      credentials_source: 'database',
+    };
+    console.log(`[loadIntegration] Using per-company credentials for ${company_id}`);
+  } else {
+    // Fallback to global env vars
+    integration = {
+      ...integration,
+      e2_client_id: process.env.E2_CLIENT_ID,
+      e2_client_secret: process.env.E2_CLIENT_SECRET,
+      e2_base_url: process.env.E2_BASE_URL,
+      e2_scope: process.env.E2_SCOPE || 'openid',
+      credentials_source: 'environment',
+    };
+    console.log(`[loadIntegration] Using global env credentials (fallback) for ${company_id}`);
+  }
+
+  return { ok: true, integration };
 }
 
 // Read E2 response safely (JSON or text)
@@ -158,7 +204,7 @@ app.get("/", (req, res) => res.send("Avisafe ECCAIRS gateway kjører ✅"));
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 // -------------------------
-// Token test (server-side)
+// Token test (server-side) - uses global credentials
 // -------------------------
 app.post("/api/e2/token/test", async (req, res) => {
   try {
@@ -173,6 +219,55 @@ app.post("/api/e2/token/test", async (req, res) => {
 // Protected routes
 // -------------------------
 app.use("/api/eccairs", requireAuth);
+
+// -------------------------
+// Test ECCAIRS Connection (per-company credentials)
+// POST /api/eccairs/test-connection
+// -------------------------
+app.post("/api/eccairs/test-connection", async (req, res) => {
+  try {
+    if (!requireAdminSupabase(res)) return;
+
+    const { company_id, environment } = req.body;
+
+    if (!company_id || !environment) {
+      return res.status(400).json({ ok: false, error: "company_id og environment er påkrevd" });
+    }
+
+    // Load integration with credentials
+    const result = await loadIntegration({ company_id, environment });
+    if (!result.ok) {
+      return res.status(result.status).json({ 
+        ok: false, 
+        error: result.error,
+        credentials_source: 'none'
+      });
+    }
+
+    try {
+      // Try to get a token using the integration's credentials
+      const token = await getE2AccessToken(result.integration);
+      
+      return res.json({ 
+        ok: true, 
+        message: "Tilkobling vellykket",
+        credentials_source: result.integration.credentials_source,
+        base_url: result.integration.e2_base_url,
+        has_token: !!token,
+      });
+    } catch (tokenErr) {
+      return res.json({ 
+        ok: false, 
+        error: tokenErr.message,
+        credentials_source: result.integration.credentials_source,
+        base_url: result.integration.e2_base_url,
+      });
+    }
+  } catch (err) {
+    console.error("Feil i /api/eccairs/test-connection:", err);
+    return res.status(500).json({ ok: false, error: String(err.message || err) });
+  }
+});
 
 // -------------------------
 // Schemas
@@ -212,7 +307,7 @@ app.post("/api/eccairs/drafts", async (req, res) => {
 
     const company_id = access.incident.company_id;
 
-    // 1) integration
+    // 1) integration with credentials
     const integrationRes = await loadIntegration({ company_id, environment });
     if (!integrationRes.ok) return res.status(integrationRes.status).json({ ok: false, error: integrationRes.error, details: integrationRes.details });
     const integration = integrationRes.integration;
@@ -259,10 +354,10 @@ app.post("/api/eccairs/drafts", async (req, res) => {
 
     console.log("E2 payload meta:", JSON.stringify(meta, null, 2));
 
-    // 4) call E2 create
-    const token = await getE2AccessToken();
-    const base = process.env.E2_BASE_URL;
-    if (!base) return res.status(500).json({ ok: false, error: "E2_BASE_URL mangler i secrets" });
+    // 4) call E2 create with per-company credentials
+    const token = await getE2AccessToken(integration);
+    const base = integration.e2_base_url || process.env.E2_BASE_URL;
+    if (!base) return res.status(500).json({ ok: false, error: "E2_BASE_URL mangler" });
 
     const createResp = await fetch(`${base}/occurrences/create`, {
       method: "POST",
@@ -351,7 +446,7 @@ app.post("/api/eccairs/drafts/update", async (req, res) => {
     if (!exportRow?.e2_id) return res.status(400).json({ ok: false, error: "Ingen e2_id funnet. Opprett draft først." });
     if (!exportRow?.e2_version) return res.status(400).json({ ok: false, error: "Ingen e2_version funnet. Opprett draft på nytt eller hent korrekt versjon." });
 
-    // 2) integration
+    // 2) integration with credentials
     const integrationRes = await loadIntegration({ company_id: exportRow.company_id, environment });
     if (!integrationRes.ok) return res.status(integrationRes.status).json({ ok: false, error: integrationRes.error, details: integrationRes.details });
     const integration = integrationRes.integration;
@@ -375,10 +470,10 @@ app.post("/api/eccairs/drafts/update", async (req, res) => {
 
     console.log("E2 update payload meta:", JSON.stringify(meta, null, 2));
 
-    // 5) call E2 edit
-    const token = await getE2AccessToken();
-    const base = process.env.E2_BASE_URL;
-    if (!base) return res.status(500).json({ ok: false, error: "E2_BASE_URL mangler i secrets" });
+    // 5) call E2 edit with per-company credentials
+    const token = await getE2AccessToken(integration);
+    const base = integration.e2_base_url || process.env.E2_BASE_URL;
+    if (!base) return res.status(500).json({ ok: false, error: "E2_BASE_URL mangler" });
 
     const editResp = await fetch(`${base}/occurrences/edit`, {
       method: "PUT",
@@ -453,21 +548,29 @@ app.post("/api/eccairs/drafts/delete", async (req, res) => {
 
     const { e2_id, incident_id, environment } = value;
 
-    // Hvis incident_id er gitt, sjekk RLS-tilgang
+    // Hvis incident_id er gitt, sjekk RLS-tilgang og hent company_id
+    let company_id = null;
     if (incident_id) {
       const access = await assertIncidentAccess({ jwt: req.jwt, incident_id });
       if (!access.ok) return res.status(access.status).json({ ok: false, error: access.error });
+      company_id = access.incident.company_id;
     }
 
-    // Hent access token
-    const token = await getE2AccessToken();
-    const base = process.env.E2_BASE_URL;
-    if (!base) return res.status(500).json({ ok: false, error: "E2_BASE_URL mangler i secrets" });
+    // Load integration for credentials if we have company_id
+    let integration = null;
+    if (company_id) {
+      const integrationRes = await loadIntegration({ company_id, environment });
+      if (integrationRes.ok) {
+        integration = integrationRes.integration;
+      }
+    }
+
+    // Get access token (use integration if available, otherwise global)
+    const token = await getE2AccessToken(integration);
+    const base = integration?.e2_base_url || process.env.E2_BASE_URL;
+    if (!base) return res.status(500).json({ ok: false, error: "E2_BASE_URL mangler" });
 
     // ECCAIRS E2 DELETE (API Guide v4.26)
-    // URL format:
-    //   DELETE {BASE_URL}/occurrences/delete-draft/OR/{e2Id}
-    // where e2Id is the full identifier, e.g. "OR-0000000000000010"
     const type = e2_id.startsWith("VR-") ? "VR" : e2_id.startsWith("OC-") ? "OC" : "OR";
     const encodedE2Id = encodeURIComponent(String(e2_id));
 
@@ -481,7 +584,6 @@ app.post("/api/eccairs/drafts/delete", async (req, res) => {
         Authorization: `Bearer ${token}`,
         Accept: "application/json",
       },
-      // VIKTIG: Body må være tom per API-dokumentasjon
     });
 
     const { parsed: deleteJson } = await readE2Response(deleteResp);
@@ -495,7 +597,6 @@ app.post("/api/eccairs/drafts/delete", async (req, res) => {
     if (!deleteResp.ok) {
       const errMsg = deleteJson?.errorDetails || deleteJson?.message || deleteJson?.error || `E2 delete failed (${deleteResp.status})`;
       
-      // Oppdater eccairs_exports hvis incident_id er gitt
       if (incident_id) {
         await supabaseAdmin
           .from("eccairs_exports")
@@ -520,7 +621,6 @@ app.post("/api/eccairs/drafts/delete", async (req, res) => {
 
     // returnCode 1 = success i ECCAIRS
     if (deleteJson?.returnCode === 1 || deleteResp.ok) {
-      // Slett eccairs_exports rad hvis incident_id er gitt
       if (incident_id) {
         await supabaseAdmin
           .from("eccairs_exports")
@@ -538,7 +638,6 @@ app.post("/api/eccairs/drafts/delete", async (req, res) => {
       });
     }
 
-    // Ukjent respons
     return res.status(400).json({ 
       ok: false, 
       error: deleteJson?.errorDetails || "Unknown error from E2",
@@ -562,9 +661,10 @@ app.get("/api/eccairs/get-url", async (req, res) => {
 
     const { e2_id, environment } = value;
 
+    // For get-url we use global credentials as we don't have company context
     const token = await getE2AccessToken();
     const base = process.env.E2_BASE_URL;
-    if (!base) return res.status(500).json({ ok: false, error: "E2_BASE_URL mangler i secrets" });
+    if (!base) return res.status(500).json({ ok: false, error: "E2_BASE_URL mangler" });
 
     const url = `${base}/occurrences/get-URL/${encodeURIComponent(e2_id)}`;
 
@@ -609,15 +709,20 @@ app.post("/api/eccairs/submit", async (req, res) => {
     if (expErr) return res.status(500).json({ ok: false, error: "Feil ved henting av eccairs_exports", details: expErr });
     if (!exp?.e2_id) return res.status(400).json({ ok: false, error: "Ingen e2_id funnet. Opprett draft først." });
 
+    // Load integration with credentials
+    const integrationRes = await loadIntegration({ company_id: exp.company_id, environment });
+    if (!integrationRes.ok) return res.status(integrationRes.status).json({ ok: false, error: integrationRes.error });
+    const integration = integrationRes.integration;
+
     const nextAttempts = (exp.attempts || 0) + 1;
     await supabaseAdmin
       .from("eccairs_exports")
       .update({ status: "pending", attempts: nextAttempts, last_attempt_at: new Date().toISOString(), last_error: null })
       .eq("id", exp.id);
 
-    const token = await getE2AccessToken();
-    const base = process.env.E2_BASE_URL;
-    if (!base) return res.status(500).json({ ok: false, error: "E2_BASE_URL mangler i secrets" });
+    const token = await getE2AccessToken(integration);
+    const base = integration.e2_base_url || process.env.E2_BASE_URL;
+    if (!base) return res.status(500).json({ ok: false, error: "E2_BASE_URL mangler" });
 
     const payload = { e2Id: exp.e2_id, status: "SENT" };
 
@@ -679,17 +784,36 @@ app.post("/api/eccairs/attachments/:e2Id", upload.array("files", 10), async (req
     const attributePath = req.body.attributePath || "24.ATTRIBUTES.793"; // Default: occurrence level
     const versionType = req.body.versionType || "DRAFT";
     const entityID = req.body.entityID || null;
+    const incident_id = req.body.incident_id || null;
 
     // Validate versionType
     if (!["DRAFT", "MINOR", "MAJOR"].includes(versionType)) {
       return res.status(400).json({ ok: false, error: "versionType må være DRAFT, MINOR eller MAJOR" });
     }
 
+    // Try to get integration credentials if incident_id is provided
+    let integration = null;
+    if (incident_id) {
+      const { data: exp } = await supabaseAdmin
+        .from("eccairs_exports")
+        .select("company_id")
+        .eq("incident_id", incident_id)
+        .maybeSingle();
+      
+      if (exp?.company_id) {
+        const environment = req.body.environment || "sandbox";
+        const integrationRes = await loadIntegration({ company_id: exp.company_id, environment });
+        if (integrationRes.ok) {
+          integration = integrationRes.integration;
+        }
+      }
+    }
+
     // Get E2 access token
-    const token = await getE2AccessToken();
-    const base = process.env.E2_BASE_URL;
+    const token = await getE2AccessToken(integration);
+    const base = integration?.e2_base_url || process.env.E2_BASE_URL;
     if (!base) {
-      return res.status(500).json({ ok: false, error: "E2_BASE_URL mangler i secrets" });
+      return res.status(500).json({ ok: false, error: "E2_BASE_URL mangler" });
     }
 
     // Build multipart form data for E2 API
