@@ -817,10 +817,10 @@ app.post("/api/eccairs/attachments/:e2Id", upload.array("files", 10), async (req
       return res.status(500).json({ ok: false, error: "E2_BASE_URL mangler" });
     }
 
-    // Build multipart form data for E2 API
+    // Build multipart form data for E2 API - ONLY files in body (per Swagger docs)
     const formData = new FormData();
     
-    // Add files
+    // Add files ONLY - parameters go as query params per API spec
     for (const file of files) {
       formData.append("files", file.buffer, {
         filename: file.originalname,
@@ -828,14 +828,15 @@ app.post("/api/eccairs/attachments/:e2Id", upload.array("files", 10), async (req
       });
     }
 
-    // Add required parameters
-    formData.append("attributePath", attributePath);
-    formData.append("versionType", versionType);
+    // Build URL with query parameters (as per Swagger docs - NOT in FormData body)
+    const queryParams = new URLSearchParams();
+    queryParams.append("attributePath", attributePath);
+    queryParams.append("versionType", versionType);
     if (entityID) {
-      formData.append("entityID", entityID);
+      queryParams.append("entityID", entityID);
     }
 
-    const uploadUrl = `${base}/occurrences/attachments/${encodeURIComponent(e2Id)}`;
+    const uploadUrl = `${base}/occurrences/attachments/${encodeURIComponent(e2Id)}?${queryParams.toString()}`;
 
     // Convert FormData to Buffer for native fetch compatibility
     const formBuffer = formData.getBuffer();
