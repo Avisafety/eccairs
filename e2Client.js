@@ -6,7 +6,8 @@
 const GLOBAL_E2_BASE_URL = process.env.E2_BASE_URL;
 const GLOBAL_E2_CLIENT_ID = process.env.E2_CLIENT_ID;
 const GLOBAL_E2_CLIENT_SECRET = process.env.E2_CLIENT_SECRET;
-const GLOBAL_E2_SCOPE = process.env.E2_SCOPE || "openid";
+// Do not default to "openid"; many client_credentials setups expect no scope or a tenant-specific scope.
+const GLOBAL_E2_SCOPE = process.env.E2_SCOPE ? String(process.env.E2_SCOPE).trim() : "";
 
 if (!GLOBAL_E2_BASE_URL || !GLOBAL_E2_CLIENT_ID || !GLOBAL_E2_CLIENT_SECRET) {
   console.warn("[E2] Missing global env vars: E2_BASE_URL / E2_CLIENT_ID / E2_CLIENT_SECRET - will require per-company credentials");
@@ -76,7 +77,8 @@ async function getE2AccessToken(integration = null) {
   const clientId = integration?.e2_client_id || GLOBAL_E2_CLIENT_ID;
   const clientSecret = integration?.e2_client_secret || GLOBAL_E2_CLIENT_SECRET;
   const baseUrl = integration?.e2_base_url || GLOBAL_E2_BASE_URL;
-  const scope = integration?.e2_scope || GLOBAL_E2_SCOPE;
+  // Preserve empty-string scope (meaning: don't send `scope`), but fall back when it's null/undefined.
+  const scope = integration?.e2_scope ?? GLOBAL_E2_SCOPE;
 
   if (!clientId || !clientSecret || !baseUrl) {
     throw new Error("E2 credentials not configured (neither per-company nor global)");
@@ -92,11 +94,11 @@ async function getE2AccessToken(integration = null) {
   }
 
   // Token attempts with preferred order
+  // Prefer the documented IdP token endpoint. Avoid falling back to /oauth2/token
+  // because it often returns maintenance/WAF HTML, which hides the real OAuth error.
   const attempts = [
-    { path: "/idp/oauth2/token", mode: "body" },   // Most likely correct per ECCAIRS API Guide v4.26
+    { path: "/idp/oauth2/token", mode: "body" },
     { path: "/idp/oauth2/token", mode: "basic" },
-    { path: "/oauth2/token", mode: "body" },       // Fallback
-    { path: "/oauth2/token", mode: "basic" },
   ];
 
   let lastErr = null;

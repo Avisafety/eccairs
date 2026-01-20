@@ -161,12 +161,13 @@ async function loadIntegration({ company_id, environment }) {
   
   if (creds && creds.length > 0) {
     const c = creds[0];
+    const normalizedScope = c.e2_scope && String(c.e2_scope).trim() ? String(c.e2_scope).trim() : null;
     integration = {
       ...integration,
       e2_client_id: c.e2_client_id,
       e2_client_secret: c.e2_client_secret,
       e2_base_url: c.e2_base_url || getDefaultBaseUrl(environment),
-      e2_scope: c.e2_scope || 'openid',
+      e2_scope: normalizedScope,
       credentials_source: 'database',
     };
     console.log(`[loadIntegration] Using per-company credentials for ${company_id}`);
@@ -177,7 +178,7 @@ async function loadIntegration({ company_id, environment }) {
       e2_client_id: process.env.E2_CLIENT_ID,
       e2_client_secret: process.env.E2_CLIENT_SECRET,
       e2_base_url: process.env.E2_BASE_URL,
-      e2_scope: process.env.E2_SCOPE || 'openid',
+      e2_scope: process.env.E2_SCOPE && String(process.env.E2_SCOPE).trim() ? String(process.env.E2_SCOPE).trim() : null,
       credentials_source: 'environment',
     };
     console.log(`[loadIntegration] Using global env credentials (fallback) for ${company_id}`);
