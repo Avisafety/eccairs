@@ -24,7 +24,9 @@ async function requestToken({ baseUrl, clientId, clientSecret, scope }, tokenPat
   const body = new URLSearchParams({
     grant_type: "client_credentials",
   });
-  if (scope) body.set("scope", scope);
+  // IMPORTANT: Some IdPs require the `scope` parameter to be present even when empty
+  // (i.e. `scope=`) to use server-side defaults. Therefore we include it for empty-string.
+  if (scope !== undefined && scope !== null) body.set("scope", String(scope));
 
   const headers = {
     Accept: "application/json",
@@ -40,6 +42,9 @@ async function requestToken({ baseUrl, clientId, clientSecret, scope }, tokenPat
 
   const url = `${baseUrl}${tokenPath}`;
   console.log(`[E2] Token request: ${url} (mode: ${mode})`);
+  console.log(
+    `[E2] Token request scope: ${scope === undefined ? "(undefined)" : scope === null ? "(null)" : `len=${String(scope).length}`}`
+  );
 
   const res = await fetch(url, { method: "POST", headers, body });
   const text = await res.text();
