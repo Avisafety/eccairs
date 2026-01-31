@@ -128,8 +128,8 @@ async function assertIncidentAccess({ jwt, incident_id }) {
 // Get default base URL based on environment
 function getDefaultBaseUrl(environment) {
   return environment === 'prod'
-    ? 'https://api.aviationreporting.eu'
-    : 'https://api.uat.aviationreporting.eu';
+    ? 'https://e2.aviationreporting.eu'
+    : 'https://e2.uat.aviationreporting.eu';
 }
 
 // Load active integration for company+env with per-company credentials support
