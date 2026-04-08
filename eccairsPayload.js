@@ -121,14 +121,53 @@ async function loadIncidentAttributesGeneric(supabase, incident_id) {
 // Entity path overrides - attributter som alltid må ligge under en spesifikk entitet
 // -------------------------
 const ENTITY_PATH_OVERRIDES = {
-  '390': '14',  // Event_Type -> Events entity (Entity 14)
-  '32': '4',    // Aircraft Category -> Aircraft entity (Entity 4)
+  '390': '14',   // Event_Type -> Events entity (Entity 14)
+  '391': '14',   // Risk Classification -> Events entity (Entity 14)
+  '1065': '53',  // Risk classification (internal) -> Reporting history (Entity 53)
+  '1068': '53',  // Risk assessment -> Reporting history (Entity 53)
+  '32': '4',     // Aircraft Category -> Aircraft entity (Entity 4)
+  '215': '4',    // Operator -> Aircraft entity (Entity 4)
+  
+  '438': '53',   // Report identification -> Reporting history (Entity 53)
+  '447': '53',   // Reporting entity -> Reporting history (Entity 53)
+  '476': '53',   // Report source -> Reporting history (Entity 53)
+  '495': '53',   // Reporting form type -> Reporting history (Entity 53)
+  '800': '53',   // Report status -> Reporting history (Entity 53)
+  '801': '53',   // Reporting date -> Reporting history (Entity 53)
+  '802': '53',   // Report (attachments) -> Reporting history (Entity 53)
+  '1064': '53',  // Parties informed -> Reporting history (Entity 53)
+  '1091': '53',  // Reporter's Language -> Reporting history (Entity 53)
+  '1092': '53',  // Reporter's Description -> Reporting history (Entity 53)
+  '646': '4',    // Birds/wildlife seen -> Aircraft entity (Entity 4)
+  '647': '4',    // Birds/wildlife struck -> Aircraft entity (Entity 4)
+  '648': '4',    // Bird size -> Aircraft entity (Entity 4)
+  '649': '4',    // Pilot advised of birds -> Aircraft entity (Entity 4)
 };
+
+// -------------------------
+// Attributes to skip (removed/invalid fields that may still exist in DB)
+// -------------------------
+const SKIP_ATTRIBUTES = new Set(['216', '393', '394']);
 
 // -------------------------
 // Attributes that must ALWAYS be at top-level (Entity 24) regardless of DB value
 // -------------------------
 const FORCE_TOP_LEVEL = new Set(['432', '448']);
+
+// -------------------------
+// Format overrides - force correct format for attributes where DB rows may have wrong format
+// -------------------------
+const FORMAT_OVERRIDES = {
+  '495': 'content_object_array',   // Reporting form type - E2 expects content_object_array
+  '1064': 'content_object_array',  // Parties informed - E2 expects content_object_array
+};
+
+// -------------------------
+// Max length constraints per E2 schema
+// -------------------------
+const MAX_LENGTH = {
+  '244': 11, // Aircraft serial number - E2 allows max 11 chars
+};
 
 // -------------------------
 // Build selections fra incident_eccairs_attributes
@@ -141,6 +180,7 @@ async function buildSelections({ supabase, incident_id, company_id }) {
     for (const r of generic) {
       const code = toAttributeCode(r.attribute_code);
       if (!code) continue;
+      if (SKIP_ATTRIBUTES.has(code)) continue;
       
       // Force certain attributes to top-level, ignoring any stored entity_path
       let entityPath;
@@ -150,12 +190,22 @@ async function buildSelections({ supabase, incident_id, company_id }) {
         entityPath = r.entity_path || ENTITY_PATH_OVERRIDES[code] || null;
       }
       
+      
+      // Apply format overrides for attributes where DB may have wrong format
+      const format = FORMAT_OVERRIDES[code] || ensureString(r.format) || "value_list_int_array";
+      
+      // Apply max length truncation for string values
+      let textValue = ensureString(r.text_value);
+      if (textValue && MAX_LENGTH[code]) {
+        textValue = textValue.slice(0, MAX_LENGTH[code]);
+      }
+      
       selections.push({
         code,
         taxonomy_code: ensureString(r.taxonomy_code) || "24",
-        format: ensureString(r.format) || "value_list_int_array",
+        format,
         valueId: ensureString(r.value_id),
-        text: ensureString(r.text_value),
+        text: textValue,
         raw: r.payload_json || null,
         entity_path: entityPath,
       });
@@ -247,6 +297,16 @@ function selectionToE2Value(sel) {
     return [n];
   }
 
+  // 4b. Code and additional text (e.g. 215 Operator - integer code + free text name)
+  if (sel.format === "code_and_additional_text") {
+    const n = asInt(sel.valueId);
+    if (n == null) return null;
+    if (sel.text) {
+      return [{ content: [n], additionalText: sel.text }];
+    }
+    return [{ content: [n] }];
+  }
+
   // 5. Local date (433)
   if (sel.format === "local_date" || sel.format === "date_array") {
     if (!sel.text) return null;
@@ -335,16 +395,16 @@ async function buildE2Payload({ supabase, incident, exportRow, integration, envi
     (ensureString(s.taxonomy_code) || "24") === "24"
   );
 
-  // Valider value-list seleksjoner
+  // Valider value-list seleksjoner (including code_and_additional_text which also uses VL codes)
   const valueListCandidates = filtered
-    .filter((s) => s.format === "value_list_int_array")
+    .filter((s) => s.format === "value_list_int_array" || s.format === "code_and_additional_text")
     .filter((s) => s.valueId)
     .map((s) => ({ code: s.code, valueId: s.valueId }));
 
   const validSet = await validateValueListSelections(supabase, valueListCandidates);
 
   for (const sel of filtered) {
-    if (sel.format === "value_list_int_array") {
+    if (sel.format === "value_list_int_array" || sel.format === "code_and_additional_text") {
       if (!sel.valueId) continue;
       const key = `VL${sel.code}:${sel.valueId}`;
       if (!validSet.has(key)) {
