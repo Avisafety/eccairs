@@ -72,7 +72,12 @@ async function validateValueListSelections(supabase, selections) {
     if (!sel?.code || sel?.valueId == null) continue;
     const code = String(sel.code);
     if (!byCode.has(code)) byCode.set(code, new Set());
-    byCode.get(code).add(String(sel.valueId));
+    const ids = parseValueIds(sel.valueId);
+    if (ids) {
+      for (const id of ids) byCode.get(code).add(String(id));
+    } else {
+      byCode.get(code).add(String(sel.valueId));
+    }
   }
 
   for (const [code, valueSet] of byCode.entries()) {
@@ -423,8 +428,9 @@ async function buildE2Payload({ supabase, incident, exportRow, integration, envi
   for (const sel of filtered) {
     if (sel.format === "value_list_int_array" || sel.format === "code_and_additional_text") {
       if (!sel.valueId) continue;
-      const key = `VL${sel.code}:${sel.valueId}`;
-      if (!validSet.has(key)) {
+      const ids = parseValueIds(sel.valueId);
+      const allValid = ids && ids.every(id => validSet.has(`VL${sel.code}:${id}`));
+      if (!allValid) {
         rejected.push({
           attribute_code: sel.code,
           value_id: sel.valueId,
