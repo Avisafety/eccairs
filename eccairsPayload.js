@@ -26,6 +26,20 @@ function asInt(v) {
   return n;
 }
 
+// Shared parser for valueId - handles both JSON arrays like '["1116"]' and plain strings like "5"
+function parseValueIds(valueId) {
+  if (!valueId) return null;
+  try {
+    if (typeof valueId === 'string' && valueId.startsWith('[')) {
+      const arr = JSON.parse(valueId);
+      const ids = (Array.isArray(arr) ? arr : [arr]).map(v => asInt(v)).filter(n => n != null);
+      return ids.length > 0 ? ids : null;
+    }
+  } catch (e) { /* fall through */ }
+  const n = asInt(valueId);
+  return n != null ? [n] : null;
+}
+
 // Generer unik entity-ID (34 tegn)
 function generateEntityId(suffix = "1") {
   const id = "ID" + String(suffix).padStart(32, "0");
@@ -158,6 +172,7 @@ const FORCE_TOP_LEVEL = new Set(['432', '448']);
 // Format overrides - force correct format for attributes where DB rows may have wrong format
 // -------------------------
 const FORMAT_OVERRIDES = {
+  '454': 'code_and_additional_text', // State/area of occurrence - E2 spec: Code and Additional Text
   '495': 'content_object_array',   // Reporting form type - E2 expects content_object_array
   '1064': 'content_object_array',  // Parties informed - E2 expects content_object_array
 };
@@ -279,9 +294,9 @@ function selectionToE2Value(sel) {
 
   // 2. Content object array - content må være integer array
   if (sel.format === "content_object_array") {
-    const n = asInt(sel.valueId);
-    if (n == null) return null;
-    return [{ content: [n] }];
+    const ids = parseValueIds(sel.valueId);
+    if (!ids) return null;
+    return ids.map(n => ({ content: [n] }));
   }
 
   // 3. Text content array (for narrativer, 1087 etc.)
@@ -299,12 +314,14 @@ function selectionToE2Value(sel) {
 
   // 4b. Code and additional text (e.g. 215 Operator - integer code + free text name)
   if (sel.format === "code_and_additional_text") {
-    const n = asInt(sel.valueId);
-    if (n == null) return null;
-    if (sel.text) {
-      return [{ content: [n], additionalText: sel.text }];
-    }
-    return [{ content: [n] }];
+    const ids = parseValueIds(sel.valueId);
+    if (!ids) return null;
+    return ids.map((n, i) => {
+      if (i === 0 && sel.text) {
+        return { content: [n], additionalText: sel.text };
+      }
+      return { content: [n] };
+    });
   }
 
   // 5. Local date (433)
