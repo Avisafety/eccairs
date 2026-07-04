@@ -267,6 +267,18 @@ async function readE2Response(resp) {
   }
 }
 
+function describeE2Integration(integration, environment, project) {
+  return {
+    project_ref: project?.ref || null,
+    company_id: integration?.company_id || null,
+    environment,
+    credentials_source: integration?.credentials_source || null,
+    client_id: integration?.e2_client_id || null,
+    base_url: integration?.e2_base_url || null,
+    scope: integration?.e2_scope || process.env.E2_SCOPE || "openid",
+  };
+}
+
 // -------------------------
 // Health
 // -------------------------
@@ -315,8 +327,9 @@ app.post("/api/eccairs/test-connection", async (req, res) => {
     }
 
     try {
-      // Try to get a token using the integration's credentials
-      const token = await getE2AccessToken(result.integration);
+      // Try to get a fresh token using the integration's credentials. Test must not use
+      // a previous cached token, otherwise changed/incorrect credentials can look valid.
+      const token = await getE2AccessToken(result.integration, { force: true });
       
       return res.json({ 
         ok: true, 
@@ -429,6 +442,8 @@ app.post("/api/eccairs/drafts", async (req, res) => {
     const token = await getE2AccessToken(integration);
     const base = integration.e2_base_url || process.env.E2_BASE_URL;
     if (!base) return res.status(500).json({ ok: false, error: "E2_BASE_URL mangler" });
+
+    console.log("E2 CREATE REQUEST", describeE2Integration(integration, environment, req.project));
 
     const createResp = await fetch(`${base}/occurrences/create`, {
       method: "POST",
