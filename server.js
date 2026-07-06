@@ -57,65 +57,31 @@ app.use(express.json({ limit: "2mb" }));
 // -------------------------
 // Supabase setup
 // -------------------------
-// Multi-tenant Supabase setup: one gateway serves several Supabase projects.
-// Each project is registered by its project ref (the "<ref>.supabase.co" subdomain).
-// Incoming JWTs are routed to the matching project based on the token issuer,
-// so app.avisafe.no (old project) and the mil/forsvaret project can share this gateway.
-const PROJECTS = {}; // ref -> { ref, url, anonKey, admin }
+const SUPABASE_URL = process.env.SUPABASE_URL || "https://pmucsvrypogtttrajqxq.supabase.co";
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 
-const refFromUrl = (url) => {
-  try {
-    return new URL(url).hostname.split(".")[0];
-  } catch {
-    return null;
-  }
-};
-
-const registerProject = (url, serviceKey, anonKey) => {
-  if (!url || !serviceKey) return;
-  const ref = refFromUrl(url);
-  if (!ref) {
-    console.warn(`Kunne ikke utlede prosjekt-ref fra SUPABASE_URL: ${url}`);
-    return;
-  }
-  PROJECTS[ref] = {
-    ref,
-    url,
-    anonKey: anonKey || null,
-    admin: createClient(url, serviceKey, { auth: { persistSession: false } }),
-  };
-  console.log(`[gateway] Registrerte Supabase-prosjekt: ${ref}`);
-};
-
-// Base project (kept as-is for backwards compatibility with existing Fly secrets)
-registerProject(
-  process.env.SUPABASE_URL || "https://pmucsvrypogtttrajqxq.supabase.co",
-  process.env.SUPABASE_SERVICE_ROLE_KEY,
-  process.env.SUPABASE_ANON_KEY,
-);
-// Additional project (mil/forsvaret)
-registerProject(
-  process.env.SUPABASE_URL_MIL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY_MIL,
-  process.env.SUPABASE_ANON_KEY_MIL,
-);
-
-if (Object.keys(PROJECTS).length === 0) {
-  console.warn("Ingen Supabase-prosjekter konfigurert! Sett SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY (og evt. _MIL).");
+let supabaseAdmin = null;
+if (!SUPABASE_SERVICE_ROLE_KEY) {
+  console.warn("SUPABASE_SERVICE_ROLE_KEY mangler! Gateway kan ikke skrive til Supabase.");
+} else {
+  supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+    auth: { persistSession: false },
+  });
 }
 
-const requireAdminSupabase = (req, res) => {
-  if (!req.supabaseAdmin) {
+const requireAdminSupabase = (res) => {
+  if (!supabaseAdmin) {
     res.status(503).json({ ok: false, error: "Supabase (service role) er ikke konfigurert" });
     return false;
   }
   return true;
 };
 
-// user-scoped client (RLS) for a specific project
-const makeUserSupabase = (jwt, project) => {
-  if (!project?.anonKey) return null;
-  return createClient(project.url, project.anonKey, {
+// user-scoped client (RLS)
+const makeUserSupabase = (jwt) => {
+  if (!SUPABASE_ANON_KEY) return null;
+  return createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
     auth: { persistSession: false },
     global: { headers: { Authorization: `Bearer ${jwt}` } },
   });
@@ -127,62 +93,28 @@ const getBearerToken = (req) => {
   return m ? m[1] : null;
 };
 
-// Decode a JWT payload (no verification) just to route to the right project.
-const projectRefFromJwt = (jwt) => {
-  try {
-    const payload = JSON.parse(Buffer.from(jwt.split(".")[1], "base64url").toString("utf8"));
-    if (payload?.iss) {
-      const ref = refFromUrl(payload.iss);
-      if (ref) return ref;
-    }
-    if (payload?.ref) return payload.ref;
-  } catch {
-    // fall through
-  }
-  return null;
-};
-
 // Auth middleware for /api/eccairs/*
 const requireAuth = async (req, res, next) => {
+  const apiKey = req.headers["x-api-key"];
+  const expectedApiKey = process.env.GATEWAY_API_KEY;
+  if (expectedApiKey && apiKey && apiKey === expectedApiKey) return next();
+
   const jwt = getBearerToken(req);
   if (!jwt) return res.status(401).json({ ok: false, error: "Missing Authorization: Bearer <token>" });
 
-  const ref = projectRefFromJwt(jwt);
-  const project = ref ? PROJECTS[ref] : null;
+  if (!requireAdminSupabase(res)) return;
 
-  const apiKey = req.headers["x-api-key"];
-  const expectedApiKey = process.env.GATEWAY_API_KEY;
-  const apiKeyOk = expectedApiKey && apiKey && apiKey === expectedApiKey;
-
-  if (!project) {
-    // Unknown project: allow the shared API key path to fall back to the base project.
-    const baseRef = refFromUrl(process.env.SUPABASE_URL || "https://pmucsvrypogtttrajqxq.supabase.co");
-    const fallback = baseRef ? PROJECTS[baseRef] : null;
-    if (apiKeyOk && fallback) {
-      req.supabaseAdmin = fallback.admin;
-      req.project = fallback;
-      req.jwt = jwt;
-      return next();
-    }
-    return res.status(401).json({ ok: false, error: "Invalid session token (ukjent prosjekt)" });
-  }
-
-  req.supabaseAdmin = project.admin;
-  req.project = project;
-  req.jwt = jwt;
-
-  if (apiKeyOk) return next();
-
-  const { data, error } = await project.admin.auth.getUser(jwt);
+  const { data, error } = await supabaseAdmin.auth.getUser(jwt);
   if (error || !data?.user) return res.status(401).json({ ok: false, error: "Invalid session token" });
 
   req.user = data.user;
+  req.jwt = jwt;
   return next();
 };
 
 // RLS access check: must be able to read incident via anon+jwt
-async function assertIncidentAccess({ jwt, incident_id, project }) {
-  const userSb = makeUserSupabase(jwt, project);
+async function assertIncidentAccess({ jwt, incident_id }) {
+  const userSb = makeUserSupabase(jwt);
   if (!userSb) {
     return { ok: false, status: 500, error: "SUPABASE_ANON_KEY mangler i Fly secrets (trengs for RLS-sjekk)" };
   }
@@ -193,7 +125,6 @@ async function assertIncidentAccess({ jwt, incident_id, project }) {
   return { ok: true, incident: data };
 }
 
-
 // Get default base URL based on environment
 function getDefaultBaseUrl(environment) {
   return environment === 'prod'
@@ -202,8 +133,8 @@ function getDefaultBaseUrl(environment) {
 }
 
 // Load active integration for company+env with per-company credentials support
-async function loadIntegration({ company_id, environment, admin }) {
-  const { data, error } = await admin
+async function loadIntegration({ company_id, environment }) {
+  const { data, error } = await supabaseAdmin
     .from("eccairs_integrations")
     .select("*")
     .eq("company_id", company_id)
@@ -215,7 +146,7 @@ async function loadIntegration({ company_id, environment, admin }) {
   if (!data) return { ok: false, status: 400, error: "ECCAIRS integrasjon er ikke konfigurert for dette selskapet/miljøet" };
 
   // Try to get per-company credentials from Supabase RPC (decrypted)
-  const { data: creds, error: credErr } = await admin
+  const { data: creds, error: credErr } = await supabaseAdmin
     .rpc("get_eccairs_credentials", {
       p_company_id: company_id,
       p_environment: environment,
@@ -267,18 +198,6 @@ async function readE2Response(resp) {
   }
 }
 
-function describeE2Integration(integration, environment, project) {
-  return {
-    project_ref: project?.ref || null,
-    company_id: integration?.company_id || null,
-    environment,
-    credentials_source: integration?.credentials_source || null,
-    client_id: integration?.e2_client_id || null,
-    base_url: integration?.e2_base_url || null,
-    scope: integration?.e2_scope || process.env.E2_SCOPE || "openid",
-  };
-}
-
 // -------------------------
 // Health
 // -------------------------
@@ -308,7 +227,7 @@ app.use("/api/eccairs", requireAuth);
 // -------------------------
 app.post("/api/eccairs/test-connection", async (req, res) => {
   try {
-    if (!requireAdminSupabase(req, res)) return;
+    if (!requireAdminSupabase(res)) return;
 
     const { company_id, environment } = req.body;
 
@@ -317,7 +236,7 @@ app.post("/api/eccairs/test-connection", async (req, res) => {
     }
 
     // Load integration with credentials
-    const result = await loadIntegration({ company_id, environment, admin: req.supabaseAdmin });
+    const result = await loadIntegration({ company_id, environment });
     if (!result.ok) {
       return res.status(result.status).json({ 
         ok: false, 
@@ -327,9 +246,11 @@ app.post("/api/eccairs/test-connection", async (req, res) => {
     }
 
     try {
-      // Try to get a fresh token using the integration's credentials. Test must not use
-      // a previous cached token, otherwise changed/incorrect credentials can look valid.
-      const token = await getE2AccessToken(result.integration, { force: true });
+      // Force fresh token fetch so a saved-but-wrong password isn't hidden by cache
+      try { clearTokenCache(company_id); } catch (_) {}
+      // Try to get a token using the integration's credentials
+      const token = await getE2AccessToken(result.integration);
+      
       
       return res.json({ 
         ok: true, 
@@ -351,6 +272,28 @@ app.post("/api/eccairs/test-connection", async (req, res) => {
     return res.status(500).json({ ok: false, error: String(err.message || err) });
   }
 });
+
+// -------------------------
+// Clear cached E2 token for a company (call after credential save)
+// POST /api/eccairs/clear-token-cache
+// -------------------------
+app.post("/api/eccairs/clear-token-cache", async (req, res) => {
+  try {
+    if (!requireAdminSupabase(res)) return;
+    const { company_id, environment } = req.body || {};
+    if (!company_id) {
+      return res.status(400).json({ ok: false, error: "company_id er påkrevd" });
+    }
+    try { clearTokenCache(company_id); } catch (_) {}
+    console.log(`[clear-token-cache] company=${company_id} env=${environment || 'n/a'}`);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Feil i /api/eccairs/clear-token-cache:", err);
+    return res.status(200).json({ ok: false, error: String(err.message || err) });
+  }
+});
+
+
 
 // -------------------------
 // Schemas
@@ -378,7 +321,7 @@ const deleteSchema = Joi.object({
 // -------------------------
 app.post("/api/eccairs/drafts", async (req, res) => {
   try {
-    if (!requireAdminSupabase(req, res)) return;
+    if (!requireAdminSupabase(res)) return;
 
     const { error, value } = baseSchema.validate(req.body || {});
     if (error) return res.status(400).json({ ok: false, error: error.details[0].message });
@@ -386,19 +329,19 @@ app.post("/api/eccairs/drafts", async (req, res) => {
     const { incident_id, environment } = value;
 
     // 0) RLS access
-    const access = await assertIncidentAccess({ jwt: req.jwt, incident_id, project: req.project });
+    const access = await assertIncidentAccess({ jwt: req.jwt, incident_id });
     if (!access.ok) return res.status(access.status).json({ ok: false, error: access.error });
 
     const company_id = access.incident.company_id;
 
     // 1) integration with credentials
-    const integrationRes = await loadIntegration({ company_id, environment, admin: req.supabaseAdmin });
+    const integrationRes = await loadIntegration({ company_id, environment });
     if (!integrationRes.ok) return res.status(integrationRes.status).json({ ok: false, error: integrationRes.error, details: integrationRes.details });
     const integration = integrationRes.integration;
 
     // 2) upsert export row
     const nowIso = new Date().toISOString();
-    const { data: existing } = await req.supabaseAdmin
+    const { data: existing } = await supabaseAdmin
       .from("eccairs_exports")
       .select("id, attempts")
       .eq("incident_id", incident_id)
@@ -407,7 +350,7 @@ app.post("/api/eccairs/drafts", async (req, res) => {
 
     const nextAttempts = (existing?.attempts || 0) + 1;
 
-    const { data: exportRow, error: upErr } = await req.supabaseAdmin
+    const { data: exportRow, error: upErr } = await supabaseAdmin
       .from("eccairs_exports")
       .upsert(
         {
@@ -428,7 +371,7 @@ app.post("/api/eccairs/drafts", async (req, res) => {
 
     // 3) build payload
     const { payload, meta } = await buildE2Payload({
-      supabase: req.supabaseAdmin,
+      supabase: supabaseAdmin,
       incident: { id: incident_id },
       exportRow,
       integration,
@@ -442,8 +385,6 @@ app.post("/api/eccairs/drafts", async (req, res) => {
     const token = await getE2AccessToken(integration);
     const base = integration.e2_base_url || process.env.E2_BASE_URL;
     if (!base) return res.status(500).json({ ok: false, error: "E2_BASE_URL mangler" });
-
-    console.log("E2 CREATE REQUEST", describeE2Integration(integration, environment, req.project));
 
     const createResp = await fetch(`${base}/occurrences/create`, {
       method: "POST",
@@ -462,7 +403,7 @@ app.post("/api/eccairs/drafts", async (req, res) => {
     if (!createResp.ok) {
       const errMsg = createJson?.errorDetails || createJson?.message || createJson?.error || `E2 create failed (${createResp.status})`;
 
-      await req.supabaseAdmin
+      await supabaseAdmin
         .from("eccairs_exports")
         .update({
           status: "failed",
@@ -479,7 +420,7 @@ app.post("/api/eccairs/drafts", async (req, res) => {
     const e2Id = createJson?.data?.e2Id || createJson?.e2Id || null;
     const e2Version = createJson?.data?.version || createJson?.version || null;
 
-    const { data: updatedExport, error: updErr } = await req.supabaseAdmin
+    const { data: updatedExport, error: updErr } = await supabaseAdmin
       .from("eccairs_exports")
       .update({
         status: "draft_created",
@@ -509,7 +450,7 @@ app.post("/api/eccairs/drafts", async (req, res) => {
 // -------------------------
 app.post("/api/eccairs/drafts/update", async (req, res) => {
   try {
-    if (!requireAdminSupabase(req, res)) return;
+    if (!requireAdminSupabase(res)) return;
 
     const { error, value } = baseSchema.validate(req.body || {});
     if (error) return res.status(400).json({ ok: false, error: error.details[0].message });
@@ -517,11 +458,11 @@ app.post("/api/eccairs/drafts/update", async (req, res) => {
     const { incident_id, environment } = value;
 
     // 0) RLS access
-    const access = await assertIncidentAccess({ jwt: req.jwt, incident_id, project: req.project });
+    const access = await assertIncidentAccess({ jwt: req.jwt, incident_id });
     if (!access.ok) return res.status(access.status).json({ ok: false, error: access.error });
 
     // 1) fetch export row
-    const { data: exportRow, error: expErr } = await req.supabaseAdmin
+    const { data: exportRow, error: expErr } = await supabaseAdmin
       .from("eccairs_exports")
       .select("*")
       .eq("incident_id", incident_id)
@@ -533,20 +474,20 @@ app.post("/api/eccairs/drafts/update", async (req, res) => {
     if (!exportRow?.e2_version) return res.status(400).json({ ok: false, error: "Ingen e2_version funnet. Opprett draft på nytt eller hent korrekt versjon." });
 
     // 2) integration with credentials
-    const integrationRes = await loadIntegration({ company_id: exportRow.company_id, environment, admin: req.supabaseAdmin });
+    const integrationRes = await loadIntegration({ company_id: exportRow.company_id, environment });
     if (!integrationRes.ok) return res.status(integrationRes.status).json({ ok: false, error: integrationRes.error, details: integrationRes.details });
     const integration = integrationRes.integration;
 
     // 3) mark pending attempt
     const nextAttempts = (exportRow.attempts || 0) + 1;
-    await req.supabaseAdmin
+    await supabaseAdmin
       .from("eccairs_exports")
       .update({ status: "pending", attempts: nextAttempts, last_attempt_at: new Date().toISOString(), last_error: null })
       .eq("id", exportRow.id);
 
     // 4) build payload (edit mode)
     const { payload, meta } = await buildE2Payload({
-      supabase: req.supabaseAdmin,
+      supabase: supabaseAdmin,
       incident: { id: incident_id },
       exportRow,
       integration,
@@ -582,7 +523,7 @@ app.post("/api/eccairs/drafts/update", async (req, res) => {
 
       console.error("E2 EDIT FAILED", { status: editResp.status, errMsg, editJson });
 
-      await req.supabaseAdmin
+      await supabaseAdmin
         .from("eccairs_exports")
         .update({
           status: "failed",
@@ -598,7 +539,7 @@ app.post("/api/eccairs/drafts/update", async (req, res) => {
 
     const newVersion = editJson?.data?.version ?? editJson?.version ?? exportRow.e2_version ?? null;
 
-    const { data: updatedExport, error: updErr } = await req.supabaseAdmin
+    const { data: updatedExport, error: updErr } = await supabaseAdmin
       .from("eccairs_exports")
       .update({
         status: "draft_updated",
@@ -627,7 +568,7 @@ app.post("/api/eccairs/drafts/update", async (req, res) => {
 // -------------------------
 app.post("/api/eccairs/drafts/delete", async (req, res) => {
   try {
-    if (!requireAdminSupabase(req, res)) return;
+    if (!requireAdminSupabase(res)) return;
 
     const { error, value } = deleteSchema.validate(req.body || {});
     if (error) return res.status(400).json({ ok: false, error: error.details[0].message });
@@ -637,7 +578,7 @@ app.post("/api/eccairs/drafts/delete", async (req, res) => {
     // Hvis incident_id er gitt, sjekk RLS-tilgang og hent company_id
     let company_id = null;
     if (incident_id) {
-      const access = await assertIncidentAccess({ jwt: req.jwt, incident_id, project: req.project });
+      const access = await assertIncidentAccess({ jwt: req.jwt, incident_id });
       if (!access.ok) return res.status(access.status).json({ ok: false, error: access.error });
       company_id = access.incident.company_id;
     }
@@ -645,7 +586,7 @@ app.post("/api/eccairs/drafts/delete", async (req, res) => {
     // Load integration for credentials if we have company_id
     let integration = null;
     if (company_id) {
-      const integrationRes = await loadIntegration({ company_id, environment, admin: req.supabaseAdmin });
+      const integrationRes = await loadIntegration({ company_id, environment });
       if (integrationRes.ok) {
         integration = integrationRes.integration;
       }
@@ -684,7 +625,7 @@ app.post("/api/eccairs/drafts/delete", async (req, res) => {
       const errMsg = deleteJson?.errorDetails || deleteJson?.message || deleteJson?.error || `E2 delete failed (${deleteResp.status})`;
       
       if (incident_id) {
-        await req.supabaseAdmin
+        await supabaseAdmin
           .from("eccairs_exports")
           .update({
             status: "delete_failed",
@@ -708,7 +649,7 @@ app.post("/api/eccairs/drafts/delete", async (req, res) => {
     // returnCode 1 = success i ECCAIRS
     if (deleteJson?.returnCode === 1 || deleteResp.ok) {
       if (incident_id) {
-        await req.supabaseAdmin
+        await supabaseAdmin
           .from("eccairs_exports")
           .delete()
           .eq("incident_id", incident_id)
@@ -749,10 +690,10 @@ app.get("/api/eccairs/get-url", async (req, res) => {
 
     let integration = null;
     if (incident_id) {
-      const access = await assertIncidentAccess({ jwt: req.jwt, incident_id, project: req.project });
+      const access = await assertIncidentAccess({ jwt: req.jwt, incident_id });
       if (!access.ok) return res.status(access.status).json({ ok: false, error: access.error });
 
-      const integrationRes = await loadIntegration({ company_id: access.incident.company_id, environment, admin: req.supabaseAdmin });
+      const integrationRes = await loadIntegration({ company_id: access.incident.company_id, environment });
       if (!integrationRes.ok) {
         return res.status(integrationRes.status).json({ ok: false, error: integrationRes.error, details: integrationRes.details });
       }
@@ -786,17 +727,17 @@ app.get("/api/eccairs/get-url", async (req, res) => {
 // -------------------------
 app.post("/api/eccairs/submit", async (req, res) => {
   try {
-    if (!requireAdminSupabase(req, res)) return;
+    if (!requireAdminSupabase(res)) return;
 
     const { error, value } = baseSchema.validate(req.body || {});
     if (error) return res.status(400).json({ ok: false, error: error.details[0].message });
 
     const { incident_id, environment } = value;
 
-    const access = await assertIncidentAccess({ jwt: req.jwt, incident_id, project: req.project });
+    const access = await assertIncidentAccess({ jwt: req.jwt, incident_id });
     if (!access.ok) return res.status(access.status).json({ ok: false, error: access.error });
 
-    const { data: exp, error: expErr } = await req.supabaseAdmin
+    const { data: exp, error: expErr } = await supabaseAdmin
       .from("eccairs_exports")
       .select("*")
       .eq("incident_id", incident_id)
@@ -807,12 +748,12 @@ app.post("/api/eccairs/submit", async (req, res) => {
     if (!exp?.e2_id) return res.status(400).json({ ok: false, error: "Ingen e2_id funnet. Opprett draft først." });
 
     // Load integration with credentials
-    const integrationRes = await loadIntegration({ company_id: exp.company_id, environment, admin: req.supabaseAdmin });
+    const integrationRes = await loadIntegration({ company_id: exp.company_id, environment });
     if (!integrationRes.ok) return res.status(integrationRes.status).json({ ok: false, error: integrationRes.error });
     const integration = integrationRes.integration;
 
     const nextAttempts = (exp.attempts || 0) + 1;
-    await req.supabaseAdmin
+    await supabaseAdmin
       .from("eccairs_exports")
       .update({ status: "pending", attempts: nextAttempts, last_attempt_at: new Date().toISOString(), last_error: null })
       .eq("id", exp.id);
@@ -834,7 +775,7 @@ app.post("/api/eccairs/submit", async (req, res) => {
     if (!r.ok) {
       const errMsg = j?.errorDetails || j?.message || j?.error || `E2 change-status failed (${r.status})`;
 
-      await req.supabaseAdmin
+      await supabaseAdmin
         .from("eccairs_exports")
         .update({ status: "failed", last_error: errMsg, response: j, payload, last_attempt_at: new Date().toISOString() })
         .eq("id", exp.id);
@@ -842,7 +783,7 @@ app.post("/api/eccairs/submit", async (req, res) => {
       return res.status(r.status).json({ ok: false, error: "E2 change-status failed", status: r.status, message: errMsg, details: j });
     }
 
-    const { data: updated, error: updErr } = await req.supabaseAdmin
+    const { data: updated, error: updErr } = await supabaseAdmin
       .from("eccairs_exports")
       .update({ status: "submitted", last_error: null, response: j, payload, last_attempt_at: new Date().toISOString() })
       .eq("id", exp.id)
@@ -865,7 +806,7 @@ app.post("/api/eccairs/submit", async (req, res) => {
 // -------------------------
 app.post("/api/eccairs/attachments/:e2Id", upload.array("files", 10), async (req, res) => {
   try {
-    if (!requireAdminSupabase(req, res)) return;
+    if (!requireAdminSupabase(res)) return;
 
     const { e2Id } = req.params;
     if (!e2Id) {
@@ -891,7 +832,7 @@ app.post("/api/eccairs/attachments/:e2Id", upload.array("files", 10), async (req
     // Try to get integration credentials if incident_id is provided
     let integration = null;
     if (incident_id) {
-      const { data: exp } = await req.supabaseAdmin
+      const { data: exp } = await supabaseAdmin
         .from("eccairs_exports")
         .select("company_id")
         .eq("incident_id", incident_id)
@@ -899,7 +840,7 @@ app.post("/api/eccairs/attachments/:e2Id", upload.array("files", 10), async (req
       
       if (exp?.company_id) {
         const environment = req.body.environment || "sandbox";
-        const integrationRes = await loadIntegration({ company_id: exp.company_id, environment, admin: req.supabaseAdmin });
+        const integrationRes = await loadIntegration({ company_id: exp.company_id, environment });
         if (integrationRes.ok) {
           integration = integrationRes.integration;
         }
